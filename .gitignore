@@ -1,0 +1,14 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Runtime data: database, agent workspaces, Codex homes, secrets
+data/
+*.db
+*.db-wal
+*.db-shm
+.env
+secret.key
+auth.json
