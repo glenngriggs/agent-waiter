@@ -1,16 +1,18 @@
 # Den agent image: one container per agent, Codex runs only via `docker exec`.
 #
 # Built by the backend on first start (DockerRuntime.prepare) as
-# den-agent:0.163.0, or by hand:
-#   docker build -t den-agent:0.163.0 container
+# den-agent:0.163.0-2, or by hand:
+#   docker build -t den-agent:0.163.0-2 container
 FROM node:22-slim
 
 # ca-certificates is required: without it Codex's model requests never
 # complete and turns hang on "Reconnecting... waiting for network".
 # The rest are tools a general-purpose assistant commonly reaches for.
+# python-is-python3 makes `python` work: models often try it first, and
+# without it every such command fails with exit 127.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates git python3 python3-pip python3-venv curl procps less \
+        ca-certificates git python3 python-is-python3 python3-pip python3-venv python3-requests curl procps less \
     && rm -rf /var/lib/apt/lists/*
 
 # Codex CLI pinned to 0.163.0, the version bundled with the Python SDK

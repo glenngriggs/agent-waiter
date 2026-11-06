@@ -51,7 +51,7 @@ OPENAI_API_KEY=...          # or OpenAI
 Open http://localhost:8000. The first agent you create builds the agent image (`container/Dockerfile`), which takes a few minutes once. You can also build it ahead of time:
 
 ```sh
-docker build -t den-agent:0.163.0 container/
+docker build -t den-agent:0.163.0-2 container/
 ```
 
 Everything the platform stores lives under `DEN_DATA_DIR` (default `~/.local/share/den`). Delete that directory, and any `den-agent-*` containers, to start over.

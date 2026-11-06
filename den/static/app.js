@@ -1204,37 +1204,153 @@
     other: "Turn failed",
   };
 
-  /** Render agent-message text: plain text, with ``` fenced blocks and `inline code`. */
+  // ---- Markdown for agent messages --------------------------------------
+  // A deliberately small Markdown subset (what models actually write):
+  // fenced code, headings, bullet and numbered lists, quotes, rules,
+  // paragraphs, and inline code, **bold**, *italic*, ~~strike~~, links and
+  // bare URLs. Every node is built with createElement/textContent, never
+  // innerHTML, so text from the model cannot inject markup or script.
+
+  /** Render agent-message Markdown into `el` (replacing its children). */
   function renderRichText(el, text) {
     el.replaceChildren();
-    const fence = /```([^\n`]*)\n?([\s\S]*?)(?:```|$)/g;
-    let last = 0;
-    let match;
-    while ((match = fence.exec(text)) !== null) {
-      if (match.index > last) appendInline(el, text.slice(last, match.index).replace(/\n$/, ""));
-      const pre = h("pre", { class: "code-block" }, h("code", { text: match[2].replace(/\n$/, "") }));
-      const lang = match[1].trim();
-      if (lang) pre.dataset.lang = lang;
-      el.appendChild(pre);
-      last = fence.lastIndex;
-      if (match[0].length === 0) fence.lastIndex += 1; // never loop on an empty match
-      if (last >= text.length) break;
+    const lines = String(text).replace(/\r\n?/g, "\n").split("\n");
+    let i = 0;
+    let para = []; // lines of the paragraph being collected
+
+    const flushPara = () => {
+      if (!para.length) return;
+      const p = h("p");
+      para.forEach((line, n) => {
+        if (n) p.appendChild(h("br")); // models use single newlines on purpose
+        appendInlineMd(p, line);
+      });
+      el.appendChild(p);
+      para = [];
+    };
+
+    while (i < lines.length) {
+      const line = lines[i];
+      let m;
+      if ((m = line.match(/^\s*```\s*([^`]*)$/))) { // fenced code block
+        flushPara();
+        const body = [];
+        i += 1;
+        while (i < lines.length && !/^\s*```\s*$/.test(lines[i])) body.push(lines[i++]);
+        i += 1; // skip the closing fence (or run off the end while streaming)
+        const pre = h("pre", { class: "code-block" }, h("code", { text: body.join("\n") }));
+        if (m[1].trim()) pre.dataset.lang = m[1].trim();
+        el.appendChild(pre);
+        continue;
+      }
+      if (!line.trim()) { flushPara(); i += 1; continue; }
+      if ((m = line.match(/^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$/))) { // heading
+        flushPara();
+        const level = Math.min(m[1].length + 2, 6); // keep headings small inside a bubble
+        const hd = h(`h${level}`, { class: "md-heading" });
+        appendInlineMd(hd, m[2]);
+        el.appendChild(hd);
+        i += 1;
+        continue;
+      }
+      if (/^\s{0,3}([-*_])(\s*\1){2,}\s*$/.test(line)) { flushPara(); el.appendChild(h("hr")); i += 1; continue; }
+      if (/^\s{0,3}>/.test(line)) { // blockquote
+        flushPara();
+        const quoted = [];
+        while (i < lines.length && /^\s{0,3}>/.test(lines[i])) quoted.push(lines[i++].replace(/^\s{0,3}>\s?/, ""));
+        const bq = h("blockquote");
+        renderRichText(bq, quoted.join("\n"));
+        el.appendChild(bq);
+        continue;
+      }
+      const bullet = /^(\s*)[-*+]\s+(.*)$/;
+      const numbered = /^(\s*)(\d{1,9})[.)]\s+(.*)$/;
+      if (bullet.test(line) || numbered.test(line)) { // list (one level, plus continuation lines)
+        flushPara();
+        const ordered = numbered.test(line);
+        const list = h(ordered ? "ol" : "ul");
+        if (ordered) list.start = Number(line.match(numbered)[2]);
+        let item = null;
+        while (i < lines.length) {
+          const cur = lines[i];
+          const b = cur.match(bullet);
+          const n = cur.match(numbered);
+          if (ordered ? n : b) {
+            item = h("li");
+            appendInlineMd(item, ordered ? n[3] : b[2]);
+            list.appendChild(item);
+            i += 1;
+          } else if (item && cur.trim() && /^\s+/.test(cur)) { // indented continuation
+            item.appendChild(h("br"));
+            appendInlineMd(item, cur.trim().replace(/^[-*+]\s+/, "• "));
+            i += 1;
+          } else {
+            break;
+          }
+        }
+        el.appendChild(list);
+        continue;
+      }
+      para.push(line);
+      i += 1;
     }
-    if (last < text.length) appendInline(el, text.slice(last).replace(/^\n/, ""));
+    flushPara();
   }
 
-  function appendInline(el, text) {
-    if (text) el.appendChild(richInline(text));
+  // Inline tokens, tried left to right; the earliest match wins.
+  const INLINE_RE = /(`[^`\n]+`)|(\*\*[^*\n]+?\*\*|__[^_\n]+?__)|(~~[^~\n]+?~~)|(\[[^\]\n]+\]\((?:[^()\s]|\([^()\s]*\))+\))|(https?:\/\/[^\s<>()]+[^\s<>().,;:!?'"\]])|(\*[^*\s][^*\n]*?\*|\b_[^_\s][^_\n]*?_\b)/;
+
+  /** Append `text` to `parent`, turning inline Markdown into elements. */
+  function appendInlineMd(parent, text) {
+    let rest = String(text);
+    while (rest) {
+      const m = rest.match(INLINE_RE);
+      if (!m) { parent.appendChild(document.createTextNode(rest)); return; }
+      if (m.index) parent.appendChild(document.createTextNode(rest.slice(0, m.index)));
+      const tok = m[0];
+      if (m[1]) {
+        parent.appendChild(h("code", { class: "inline-code", text: tok.slice(1, -1) }));
+      } else if (m[2]) {
+        const b = h("strong"); appendInlineMd(b, tok.slice(2, -2)); parent.appendChild(b);
+      } else if (m[3]) {
+        const del = h("del"); appendInlineMd(del, tok.slice(2, -2)); parent.appendChild(del);
+      } else if (m[4]) {
+        const lm = tok.match(/^\[([^\]]+)\]\(((?:[^()\s]|\([^()\s]*\))+)\)$/); // allows one level of (parens) in URLs
+        parent.appendChild(mdLink(lm[1], lm[2]));
+      } else if (m[5]) {
+        parent.appendChild(mdLink(tok, tok));
+      } else {
+        const em = h("em"); appendInlineMd(em, tok.slice(1, -1)); parent.appendChild(em);
+      }
+      rest = rest.slice(m.index + tok.length);
+    }
   }
 
-  /** A span with `backticked` runs shown as inline code; everything else is plain text. */
+  /** A span of inline Markdown (used for short labels such as schedules). */
   function richInline(text) {
     const span = h("span", { class: "rich-text" });
-    String(text).split(/(`[^`\n]+`)/).forEach((part, i) => {
-      if (i % 2 === 1) span.appendChild(h("code", { class: "inline-code", text: part.slice(1, -1) }));
-      else if (part) span.appendChild(document.createTextNode(part));
-    });
+    appendInlineMd(span, text);
     return span;
+  }
+
+  /** A safe link: web/mail links open in a new tab; /workspace/... opens the Files tab. */
+  function mdLink(label, href) {
+    let url = null;
+    const agentMatch = location.hash.match(/^#\/agent\/([0-9a-f]{32})/);
+    const ws = href.match(/^(?:\/workspace\/|\.\/|)([^:]*)$/);
+    if (/^(https?:|mailto:)/i.test(href)) {
+      url = href;
+    } else if (agentMatch && ws && (href.startsWith("/workspace/") || !href.includes("/") || href.startsWith("./"))) {
+      // A file the agent mentions: open its folder in the Files tab.
+      const path = decodeURIComponent(ws[1]).replace(/^\/+/, "");
+      const dir = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
+      url = `#/agent/${agentMatch[1]}/files?path=${encodeURIComponent(dir)}`;
+    }
+    if (!url) return document.createTextNode(label); // javascript:, data:, etc. stay plain text
+    const a = h("a", { href: url, class: "md-link" });
+    appendInlineMd(a, label);
+    if (!url.startsWith("#")) { a.target = "_blank"; a.rel = "noopener noreferrer"; }
+    return a;
   }
 
   // ---- item entries: one per Codex item, updated in place as events arrive --

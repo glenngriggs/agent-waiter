@@ -47,7 +47,7 @@ class Settings:
     chatgpt_auth_json: Path
     models: tuple[str, ...]
     model_labels: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_MODEL_LABELS))
-    agent_image: str = "den-agent:0.163.0"
+    agent_image: str = "den-agent:0.163.0-2"
     docker_network: str = "den-agents"
     container_memory: str = "2g"
     container_cpus: str = "1.0"
@@ -129,7 +129,7 @@ def load_settings(env: Mapping[str, str] = os.environ) -> Settings:
             env.get("DEN_CHATGPT_AUTH_JSON", "~/.codex/auth.json")
         ).expanduser(),
         models=models,
-        agent_image=env.get("DEN_AGENT_IMAGE", "den-agent:0.163.0"),
+        agent_image=env.get("DEN_AGENT_IMAGE", "den-agent:0.163.0-2"),
         container_uid_gid=uid_gid,
         codex_bin=env.get("DEN_CODEX_BIN") or None,
         idle_stop_minutes=_int(env.get("DEN_IDLE_STOP_MINUTES"), 15),
