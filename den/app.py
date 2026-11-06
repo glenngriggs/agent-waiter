@@ -22,6 +22,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from .security_headers import SecurityHeadersMiddleware, content_security_policy
 from . import account, agents, anthropic_bridge, auth, chat, files, jobs, lifecycle, mcp_server, model_proxy
 from . import codex_bridge
 from .codex_bridge import TurnRegistry
@@ -170,6 +171,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="AgentWaiter", lifespan=lifespan)
     app.state.settings = settings
     app.add_middleware(CSRFMiddleware)
+    app.add_middleware(
+        SecurityHeadersMiddleware,
+        csp=content_security_policy(STATIC_DIR / "index.html"),
+        hsts=settings.secure_cookies,
+    )
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
