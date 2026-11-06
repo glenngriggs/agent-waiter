@@ -190,7 +190,9 @@ def models_for(ctx: Any, user_id: str, provider_id: str) -> list[ModelInfo]:
     """Models this user may pick from this provider (whether or not a key is set)."""
     settings = ctx.settings
     if provider_id == PLATFORM:
-        return [ModelInfo(m, settings.label_for(m)) for m in settings.models]
+        # Same names and notes as the catalog where a model is listed there.
+        catalog = {m.id: m for p in CATALOG.values() for m in p.models}
+        return [catalog.get(m) or ModelInfo(m, settings.label_for(m)) for m in settings.models]
     provider = CATALOG.get(provider_id)
     if provider is None or (provider.custom_url and not settings.allow_custom_provider):
         return []
@@ -385,6 +387,16 @@ async def verify_key(ctx: Any, provider_id: str, api_key: str, base_url: str) ->
         return f"Could not reach {base_url} ({type(exc).__name__})."
     if response.status_code in (401, 403):
         return f"{provider.label} rejected this key."
-    if response.status_code == 404:
+    if response.status_code == 404 and not _is_api_error(response):
+        # A JSON API error (for example "model not found") means the endpoint
+        # exists and took the key; a bare 404 page means the URL is wrong.
         return f"There is no Responses API at {base_url}. Check the URL (it usually ends in /v1)."
     return None
+
+
+def _is_api_error(response: httpx.Response) -> bool:
+    try:
+        body = response.json()
+    except ValueError:
+        return False
+    return isinstance(body, dict) and isinstance(body.get("error"), (dict, str))

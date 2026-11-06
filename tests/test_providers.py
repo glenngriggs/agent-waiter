@@ -368,3 +368,31 @@ def test_switching_an_agent_between_providers(claude_server, client_factory, fak
     # The OpenAI-side request carried none of Claude's replay items.
     sent = fake_model.requests_containing(marker)
     assert sent and anthropic_bridge.BLOB_PREFIX not in sent[-1]["raw"]
+
+
+def test_custom_openai_compatible_provider(claude_server, client_factory, fake_model) -> None:
+    user = client_factory(claude_server)
+    register(user)
+    r = user.put("/api/providers/custom/key", json={
+        "api_key": "custom-key-123", "base_url": fake_model.url + "/v1", "models": "gpt-6-luna"})
+    assert r.status_code == 200, r.text
+    assert r.json()["provider"]["key"]["base_url"] == fake_model.url + "/v1"
+    r = user.post("/api/agents", json={"name": "C", "model": "gpt-6-luna", "provider": "custom"})
+    assert r.status_code == 201, r.text
+    agent = wait_setup_settled(user, r.json()["agent"]["id"])
+    assert agent["setup_state"] == "ready", agent["setup_detail"]
+    marker = f"custom-{time.time_ns()}"
+    assert chat(user, agent["id"], marker)["data"]["final_response"] == f"Echo: {marker}"
+    sent = fake_model.requests_containing(marker)
+    assert sent[-1]["headers"]["authorization"] == "Bearer custom-key-123"
+    # A model the user did not list is refused.
+    r = user.post("/api/agents", json={"name": "D", "model": "gpt-6.1-sol", "provider": "custom"})
+    assert r.status_code == 400
+
+
+def test_shared_models_use_catalog_names(claude_server, client_factory) -> None:
+    user = client_factory(claude_server)
+    register(user)
+    platform = _providers(user)["platform"]
+    assert platform["label"] == "Server key"
+    assert platform["models"][0] == {"id": "gpt-6.1-sol", "label": "GPT-6.1 Sol", "note": "Strongest"}

@@ -71,7 +71,7 @@ class Settings:
     # "*" for everyone. Empty by default, so a public deployment never shares
     # the operator's key unless the operator says so.
     platform_key_users: tuple[str, ...] = ()
-    platform_label: str = "Shared key on this server"
+    platform_label: str = "Server key"
     # Base URL overrides for the providers users bring keys for (tests point
     # these at fakes; operators can point them at a gateway).
     provider_base_urls: dict[str, str] = field(default_factory=dict)
@@ -178,7 +178,7 @@ def load_settings(env: Mapping[str, str] = os.environ) -> Settings:
         max_upload_mb=_int(env.get("DEN_MAX_UPLOAD_MB"), 100),
         secure_cookies=_bool(env.get("DEN_SECURE_COOKIES"), False),
         platform_key_users=platform_users,
-        platform_label=env.get("DEN_PLATFORM_LABEL", "").strip() or "Shared key on this server",
+        platform_label=env.get("DEN_PLATFORM_LABEL", "").strip() or "Server key",
         provider_base_urls=provider_urls,
         provider_extra_models=extra_models,
         allow_private_provider_urls=_bool(env.get("DEN_ALLOW_PRIVATE_PROVIDER_URLS"), False),
