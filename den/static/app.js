@@ -13,7 +13,8 @@
  *   2. Formatting                   7. Timeline renderer (chat and job-run transcripts)
  *   3. API client and toasts        8. Agent page: header, settings, tabs
  *   4. App state and router         9. Chat tab / 10. Files tab / 11. Jobs tab
- *   5. Auth, agent list, onboarding 12. Boot
+ *   5. Auth, agent list, onboarding 12. Settings page (API keys, usage, account)
+ *                                   13. Boot
  */
 (function () {
   "use strict";
@@ -97,6 +98,8 @@
     note: "M5 6h14M5 11h14M5 16h9",
     refresh: "M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7",
     chevron: "M9 6l6 6-6 6",
+    gear: "M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z",
+    external: "M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5",
   };
 
   function icon(name, extraClass) {
@@ -422,6 +425,7 @@
   const state = {
     config: null,    // GET /api/config
     user: null,      // {id, email, timezone} or null when signed out
+    providers: null, // GET /api/providers (model providers and the user's keys); null until loaded
     session: null,   // AgentSession for the agent whose page is open
     cleanups: [],    // run when the current view is replaced
     routeToken: 0,   // bumps on every navigation so late async renders can tell they are stale
@@ -474,6 +478,7 @@
 
   function handleSignedOut() {
     state.user = null;
+    state.providers = null;
     closeSession();
     renderUserBox();
     const page = parseHash().parts[0];
@@ -482,13 +487,53 @@
 
   function signedIn(user) {
     state.user = user;
+    state.providers = null;
     renderUserBox();
     go("#/agents");
   }
 
-  function modelLabel(modelId) {
+  /**
+   * The user's model providers (GET /api/providers). Cached in state.providers; pass
+   * fresh=true where the answer must be current (pickers, the API keys page).
+   */
+  async function loadProviders(fresh) {
+    if (!fresh && state.providers) return state.providers;
+    const res = await api("GET", "/api/providers");
+    state.providers = (res && res.providers) || [];
+    return state.providers;
+  }
+
+  /** Replace one provider in the cache with the server's newer copy. */
+  function storeProvider(provider) {
+    if (!provider || !state.providers) return;
+    state.providers = state.providers.map((p) => (p.id === provider.id ? provider : p));
+  }
+
+  /** A model's display name, from the providers list when it is loaded. */
+  function modelLabel(modelId, providerId) {
+    for (const p of state.providers || []) {
+      if (providerId && p.id !== providerId) continue;
+      const m = (p.models || []).find((x) => x.id === modelId);
+      if (m) return m.label;
+    }
     const m = ((state.config && state.config.models) || []).find((x) => x.id === modelId);
     return m ? m.label : String(modelId || "");
+  }
+
+  /** "Claude Sonnet 5.5 · Anthropic": the model and the provider whose key runs it. */
+  function agentModelText(a) {
+    const label = modelLabel(a.model, a.provider);
+    return a.provider_label ? `${label} · ${a.provider_label}` : label;
+  }
+
+  /** True when a failure is fixed on the Settings page (a missing or rejected key). */
+  function needsSettings(kind, message) {
+    return kind === "no_api_key" || kind === "unauthorized" || /\bSettings\b/.test(String(message || ""));
+  }
+
+  /** A link to the Settings page styled as a button; `big` drops btn-sm to sit next to full-size buttons. */
+  function settingsButton(label, big) {
+    return h("a", { class: big ? "btn" : "btn btn-sm", href: "#/settings" }, icon("gear"), label || "Open Settings");
   }
 
   function limits() {
@@ -516,12 +561,18 @@
     const root = document.getElementById("app");
     root.replaceChildren();
     document.title = "AgentWaiter";
+    const settingsLink = document.getElementById("settings-link");
+    if (page === "settings") settingsLink.setAttribute("aria-current", "page");
+    else settingsLink.removeAttribute("aria-current");
 
     let view;
     if (page === "login") view = viewLogin(root);
     else if (page === "register") view = viewRegister(root);
     else if (page === "agents") view = viewAgents(root, token);
     else if (page === "new") view = viewNewAgent(root, token);
+    else if (page === "settings" && (!parts[1] || SETTINGS_TABS.some(([key]) => key === parts[1]))) {
+      view = viewSettings(root, token, parts[1] || "keys");
+    }
     else if (page === "agent" && agentId) {
       const tab = parts[2] || "chat";
       if (["chat", "files", "jobs"].includes(tab)) view = viewAgent(root, token, agentId, tab, query);
@@ -552,6 +603,7 @@
       if (err.status !== 401) showError(err);
     }
     state.user = null;
+    state.providers = null;
     closeSession();
     renderUserBox();
     go("#/login");
@@ -651,7 +703,8 @@
     const load = async () => {
       let res;
       try {
-        res = await api("GET", "/api/agents");
+        // Providers only improve the model labels; the list shows without them.
+        [res] = await Promise.all([api("GET", "/api/agents"), loadProviders().catch(() => null)]);
       } catch (err) {
         if (isCurrent(token)) setChildren(list, errorBlock(err.message));
         return;
@@ -693,7 +746,7 @@
         avatar(a.name, a.id),
         h("div", { class: "agent-card-title" },
           h("h2", { text: a.name }),
-          h("span", { class: "muted small", text: modelLabel(a.model) }))),
+          h("span", { class: "muted small", text: agentModelText(a) }))),
       h("div", { class: "badges" },
         setup,
         a.setup_state === "ready" ? containerBadge(a.container) : null,
@@ -703,35 +756,79 @@
 
   // ---- model picker (onboarding, retry) ----------------------------------
 
-  function modelPicker(selected, groupName) {
-    const models = (state.config && state.config.models) || [];
+  /**
+   * Providers that offer at least one model, the ones that can run now first
+   * (a stable sort, so the server's order holds within each half).
+   */
+  function pickerGroups(providers) {
+    const withModels = (providers || []).filter((p) => (p.models || []).length);
+    return withModels.filter((p) => p.available).concat(withModels.filter((p) => !p.available));
+  }
+
+  /**
+   * Radio buttons for every model the user may pick, grouped under their provider.
+   * Models of providers without a usable key are shown disabled, with a link to Settings.
+   * `selected` is {provider, model}; when it cannot run, the first model that can is picked.
+   */
+  function modelPicker(providers, selected, groupName) {
     const radios = [];
-    const el = h("div", { class: "model-picker", role: "radiogroup" }, models.map((m, i) => {
-      const radio = h("input", { type: "radio", name: groupName, value: m.id, checked: selected ? m.id === selected : i === 0 });
-      radios.push(radio);
-      return h("label", { class: "model-option" }, radio,
-        h("span", { class: "model-option-body" },
-          h("span", { class: "model-option-label", text: m.label }),
-          h("span", { class: "model-option-id", text: m.id })));
-    }));
+    const groups = pickerGroups(providers).map((p) => h("div", { class: "model-group" + (p.available ? "" : " is-unavailable") },
+      h("div", { class: "model-group-head" },
+        h("span", { class: "model-group-label", text: p.label }),
+        p.available ? null : h("a", { class: "model-group-action", href: "#/settings", text: "Add a key in Settings" })),
+      h("div", { class: "model-options" }, p.models.map((m) => {
+        const radio = h("input", { type: "radio", name: groupName, disabled: !p.available, dataset: { provider: p.id, model: m.id } });
+        radios.push(radio);
+        return h("label", { class: "model-option" + (p.available ? "" : " is-disabled") }, radio,
+          h("span", { class: "model-option-body" },
+            h("span", { class: "model-option-label", text: m.label }),
+            h("span", { class: "model-option-meta" },
+              h("span", { class: "model-option-id", text: m.id }),
+              m.note ? h("span", { class: "model-option-note", text: m.note }) : null)));
+      }))));
+    const usable = radios.filter((r) => !r.disabled);
+    const pick = usable.find((r) => selected && r.dataset.provider === selected.provider && r.dataset.model === selected.model) || usable[0];
+    if (pick) pick.checked = true;
     return {
-      el,
+      el: h("div", { class: "model-picker", role: "radiogroup" }, groups),
+      hasChoice: usable.length > 0,
       value: () => {
         const r = radios.find((x) => x.checked);
-        return r ? r.value : null;
+        return r ? { provider: r.dataset.provider, model: r.dataset.model } : null;
       },
     };
   }
 
   // ---- new agent ----------------------------------------------------------
 
-  function viewNewAgent(root, token) {
+  async function viewNewAgent(root, token) {
     document.title = "New agent · AgentWaiter";
+    const card = h("div", { class: "card narrow" }, loadingRow("Loading models…"));
+    root.appendChild(card);
+    let providers;
+    try {
+      providers = await loadProviders(true);
+    } catch (err) {
+      if (isCurrent(token)) setChildren(card, errorBlock(err.message));
+      return;
+    }
+    if (!isCurrent(token)) return;
+
+    const picker = modelPicker(providers, null, "new-agent-model");
+    if (!picker.hasChoice) {
+      card.classList.add("center");
+      setChildren(card,
+        h("h1", { text: "Add an API key to create an agent" }),
+        h("p", { class: "muted", text: "Agents think with a model from a provider such as Anthropic or OpenAI. Add your key for one in Settings, then come back here." }),
+        h("div", { class: "form-actions" },
+          h("a", { class: "btn btn-ghost", href: "#/agents", text: "Cancel" }),
+          h("a", { class: "btn btn-primary", href: "#/settings" }, icon("gear"), "Open Settings")));
+      return;
+    }
+
     const name = h("input", { type: "text", maxlength: 40, required: true, placeholder: "e.g. Research helper", autocomplete: "off" });
-    const picker = modelPicker(null, "new-agent-model");
     const error = h("p", { class: "form-error", role: "alert", hidden: true });
     const submit = h("button", { class: "btn btn-primary", type: "submit" }, "Create agent");
-    const card = h("div", { class: "card narrow" });
     const form = h("form", {
       class: "stack",
       onsubmit: (e) => {
@@ -739,10 +836,12 @@
         error.hidden = true;
         const trimmed = name.value.trim();
         if (!trimmed) { error.textContent = "Give your agent a name."; error.hidden = false; return; }
+        const choice = picker.value();
+        if (!choice) { error.textContent = "Pick a model."; error.hidden = false; return; }
         withBusy(submit, async () => {
           let res;
           try {
-            res = await api("POST", "/api/agents", { name: trimmed, model: picker.value() });
+            res = await api("POST", "/api/agents", { name: trimmed, model: choice.model, provider: choice.provider });
           } catch (err) {
             error.textContent = err.message;
             error.hidden = false;
@@ -754,15 +853,14 @@
     },
     field("Name", name, "Up to 40 characters. You can rename it later."),
     h("div", { class: "field" }, h("span", { class: "field-label", text: "Model" }), picker.el,
-      h("span", { class: "field-hint", text: "The model it thinks with. You can switch later." })),
+      h("span", { class: "field-hint", text: "The model it thinks with, and whose key pays for it. You can switch later." })),
     error,
     h("div", { class: "form-actions" }, h("a", { class: "btn btn-ghost", href: "#/agents", text: "Cancel" }), submit));
 
-    card.append(
+    setChildren(card,
       h("h1", { text: "Create an agent" }),
       h("p", { class: "muted", text: "Pick a name and a model. The agent gets its own container and a workspace for files." }),
       form);
-    root.appendChild(card);
     name.focus();
 
     // After creation the same card becomes the progress list, fed by the agent's event stream.
@@ -832,13 +930,25 @@
       showingError = true;
       readyBox.hidden = true;
       const stepLabel = (SETUP_STEPS.find(([s]) => s === step) || [null, null])[1];
-      const picker = modelPicker(session.agent && session.agent.model, `retry-model-${session.agentId}`);
+      const current = session.agent ? { provider: session.agent.provider, model: session.agent.model } : null;
+      // The picker needs the providers list; until it arrives (or if it fails) Retry keeps the model.
+      let picker = null;
+      const pickerHost = h("div", { class: "field" }, h("span", { class: "field-label", text: "Try again with model" }), loadingRow("Loading models…"));
+      loadProviders(true).then((providers) => {
+        picker = modelPicker(providers, current, `retry-model-${session.agentId}`);
+        setChildren(pickerHost, h("span", { class: "field-label", text: "Try again with model" }),
+          picker.hasChoice ? picker.el : h("p", { class: "muted small" }, "No model can run yet. ", h("a", { href: "#/settings", text: "Add an API key in Settings" }), ", then retry."));
+      }).catch((err) => {
+        console.warn("Could not load providers for the retry picker", err);
+        pickerHost.hidden = true;
+      });
       const retry = h("button", { class: "btn btn-primary", type: "button" }, icon("restart"), "Retry setup");
       retry.addEventListener("click", () => withBusy(retry, async () => {
         try {
-          const chosen = picker.value();
-          if (chosen && session.agent && chosen !== session.agent.model) {
-            const patched = await api("PATCH", agentUrl(session.agentId), { model: chosen });
+          const chosen = picker && picker.hasChoice ? picker.value() : null;
+          const a = session.agent;
+          if (chosen && a && (chosen.model !== a.model || chosen.provider !== a.provider)) {
+            const patched = await api("PATCH", agentUrl(session.agentId), { provider: chosen.provider, model: chosen.model });
             session.setAgent(patched.agent);
           }
           const res = await api("POST", agentUrl(session.agentId, "/setup/retry"));
@@ -854,8 +964,8 @@
           h("div", null,
             h("strong", { text: stepLabel ? `Setup stopped at: ${stepLabel}` : "Setup failed" }),
             h("div", { text: message || "Something went wrong." }))),
-        h("div", { class: "field" }, h("span", { class: "field-label", text: "Try again with model" }), picker.el),
-        h("div", { class: "form-actions" }, retry));
+        pickerHost,
+        h("div", { class: "form-actions" }, needsSettings(null, message) ? settingsButton(null, true) : null, retry));
       errorBox.hidden = false;
     }
 
@@ -1249,6 +1359,7 @@
   // Short headings for the red failed-turn card; the server's error_message is the body.
   const ERROR_TITLES = {
     unauthorized: "Credentials rejected",
+    no_api_key: "No API key",
     rate_limited: "Rate limited",
     model_unavailable: "Model unavailable",
     context_full: "Conversation full",
@@ -2072,7 +2183,8 @@
         btn.addEventListener("click", () => this.actions.newConversation(btn));
         actions.appendChild(btn);
       }
-      if ((kind === "model_unavailable" || kind === "rate_limited") && this.actions.switchModel) {
+      if (needsSettings(kind, message)) actions.appendChild(settingsButton("Open Settings"));
+      if ((kind === "model_unavailable" || kind === "rate_limited" || kind === "no_api_key") && this.actions.switchModel) {
         actions.appendChild(h("button", { class: "btn btn-sm", type: "button", text: "Switch model", onclick: () => this.actions.switchModel() }));
       }
       return h("div", { class: "error-card", role: "alert" },
@@ -2085,7 +2197,8 @@
       if (this.mode !== "chat") return;
       if (d.state === "creating") return; // setup steps belong to the onboarding screen
       if (d.state === "error") {
-        this.add(h("div", { class: "notice notice-error" }, icon("alert"), h("span", { text: d.message || "Agent setup failed." })));
+        this.add(h("div", { class: "notice notice-error" }, icon("alert"), h("span", { text: d.message || "Agent setup failed." }),
+          needsSettings(null, d.message) ? h("a", { class: "notice-action", href: "#/settings", text: "Open Settings" }) : null));
         return;
       }
       const message = d.message || (d.state === "ready" ? "The agent is ready." : `Agent ${d.state}.`);
@@ -2147,8 +2260,11 @@
   async function viewAgent(root, token, agentId, tab, query) {
     const session = ensureSession(agentId);
     root.appendChild(loadingRow("Opening agent…"));
+    // Only for model labels in the header; the page opens without it.
+    const providersLoaded = loadProviders().catch(() => null);
     try {
       await session.ready;
+      await providersLoaded;
     } catch (err) {
       if (!isCurrent(token)) return;
       closeSession(); // a later visit retries from scratch
@@ -2224,7 +2340,7 @@
       if (!a) return;
       setChildren(titleRow, avatar(a.name, session.agentId), h("h1", { class: "agent-name", text: a.name }));
       setChildren(meta, 
-        h("span", { class: "meta-item", text: modelLabel(a.model) }),
+        h("span", { class: "meta-item", text: agentModelText(a) }),
         a.setup_state === "ready" ? containerBadge(a.container) : null,
         session.busy ? badge("Working", "info", true) : null,
         connIndicator(session.connState));
@@ -2234,7 +2350,7 @@
         else buttons.push(actionButton("start", "Start", "play", "btn-ghost"));
         buttons.push(actionButton("restart", "Restart", "restart", "btn-ghost"));
       }
-      const settingsBtn = h("button", { class: "btn btn-sm", type: "button", onclick: () => openSettings(session) }, icon("settings"), "Settings");
+      const settingsBtn = h("button", { class: "btn btn-sm", type: "button", onclick: () => openSettings(session) }, icon("settings"), "Agent settings");
       buttons.push(settingsBtn);
       setChildren(actions, ...buttons);
     };
@@ -2270,13 +2386,60 @@
     });
   }
 
-  function openSettings(session, opts) {
+  /** Option values for the model <select>: provider and model id together. */
+  function choiceValue(provider, model) {
+    return JSON.stringify([provider, model]);
+  }
+
+  /**
+   * A <select> of every model the user may pick, one <optgroup> per provider. Models of
+   * providers without a usable key are disabled, except the agent's current one.
+   */
+  function modelSelect(providers, current) {
+    const select = h("select");
+    let found = false;
+    for (const p of pickerGroups(providers)) {
+      const group = h("optgroup", { label: p.available ? p.label : `${p.label} (no key; add one in Settings)` });
+      for (const m of p.models) {
+        const isCurrent = p.id === current.provider && m.id === current.model;
+        if (isCurrent) found = true;
+        group.appendChild(h("option", {
+          value: choiceValue(p.id, m.id),
+          text: isCurrent && !p.available ? `${m.label} (current; no key)` : m.label,
+          disabled: !p.available && !isCurrent,
+          selected: isCurrent,
+        }));
+      }
+      select.appendChild(group);
+    }
+    if (!found) {
+      select.prepend(h("option", {
+        value: choiceValue(current.provider, current.model),
+        text: `${modelLabel(current.model, current.provider)} (no longer offered)`,
+        selected: true,
+      }));
+    }
+    return select;
+  }
+
+  async function openSettings(session, opts) {
     const a = session.agent;
-    if (!a) return;
-    const models = ((state.config && state.config.models) || []).slice();
-    if (!models.some((m) => m.id === a.model)) models.unshift({ id: a.model, label: `${a.model} (no longer offered)` });
+    if (!a || session.settingsOpening) return;
+    // Fresh, so a key added in another tab shows up; the cached list is the fallback.
+    session.settingsOpening = true;
+    let providers;
+    try {
+      providers = await loadProviders(true);
+    } catch (err) {
+      providers = state.providers;
+      if (!providers) { showError(err); return; }
+    } finally {
+      session.settingsOpening = false;
+    }
+    if (state.session !== session) return; // the user left the agent while the list loaded
     const name = h("input", { type: "text", value: a.name, maxlength: 40, required: true });
-    const model = h("select", null, models.map((m) => h("option", { value: m.id, text: m.label, selected: m.id === a.model })));
+    const model = modelSelect(providers, { provider: a.provider, model: a.model });
+    const missingKeys = pickerGroups(providers).some((p) => !p.available);
     const error = h("p", { class: "form-error", role: "alert", hidden: true });
     const save = h("button", { class: "btn btn-primary", type: "submit", text: "Save" });
     const cancel = h("button", { class: "btn btn-ghost", type: "button", text: "Cancel" });
@@ -2285,7 +2448,11 @@
     const form = h("form", { class: "stack" },
       h("div", { class: "dialog-head" }, h("h2", { text: "Agent settings" })),
       field("Name", name),
-      field("Model", model, "A new model applies from the next message."),
+      h("label", { class: "field" },
+        h("span", { class: "field-label", text: "Model" }),
+        model,
+        h("span", { class: "field-hint" }, `Now: ${agentModelText(a)}. A new model applies from the next message.`,
+          missingKeys ? [" ", h("a", { href: "#/settings", text: "Add a key in Settings" }), " to unlock more."] : null)),
       error,
       h("div", { class: "form-actions" }, cancel, save),
       h("div", { class: "danger-zone" },
@@ -2306,7 +2473,17 @@
       const newName = name.value.trim();
       if (!newName) { error.textContent = "The name cannot be empty."; error.hidden = false; return; }
       if (newName !== a.name) body.name = newName;
-      if (model.value !== a.model) body.model = model.value;
+      let provider = a.provider;
+      let modelId = a.model;
+      try {
+        [provider, modelId] = JSON.parse(model.value);
+      } catch (err) {
+        console.error("Unreadable model choice", model.value, err);
+      }
+      if (provider !== a.provider || modelId !== a.model) {
+        body.provider = provider;
+        body.model = modelId;
+      }
       if (!Object.keys(body).length) { dialog.close(); return; }
       withBusy(save, async () => {
         try {
@@ -3156,14 +3333,437 @@
           fact("Finished", r.finished_at ? fmtDateTime(r.finished_at) : "—"),
           fact("Duration", between(r.started_at, r.finished_at) || "—")),
         r.summary ? h("div", { class: "run-summary" }, h("div", { class: "field-label", text: "Summary" }), h("p", { text: r.summary })) : null,
-        r.error_message ? errorBlock(r.error_message) : null);
+        r.error_message ? errorBlock(r.error_message,
+          needsSettings(r.error_kind, r.error_message) ? h("a", { class: "notice-action", href: "#/settings", text: "Open Settings" }) : null) : null);
     }
 
     load();
   }
 
   // ======================================================================
-  // 12. Boot
+  // 12. Settings page: API keys, usage, account
+  // ======================================================================
+
+  const SETTINGS_TABS = [["keys", "API keys"], ["usage", "Usage"], ["account", "Account"]];
+
+  async function viewSettings(root, token, tab) {
+    document.title = "Settings · AgentWaiter";
+    const body = h("div", { class: "settings-body" });
+    root.appendChild(h("div", { class: "settings-page" },
+      h("div", { class: "page-head" },
+        h("div", null,
+          h("h1", { text: "Settings" }),
+          h("p", { class: "muted", text: "Your API keys, model usage and account." }))),
+      h("nav", { class: "tabs", "aria-label": "Settings sections" }, SETTINGS_TABS.map(([key, label]) =>
+        h("a", {
+          class: "tab" + (key === tab ? " active" : ""),
+          href: key === "keys" ? "#/settings" : `#/settings/${key}`,
+          "aria-current": key === tab ? "page" : null,
+          text: label,
+        }))),
+      body));
+    if (tab === "keys") await mountKeysTab(body, token);
+    else if (tab === "usage") await mountUsageTab(body, token);
+    else mountAccountTab(body);
+  }
+
+  // ---- API keys -----------------------------------------------------------
+
+  function agentsUsingText(n) {
+    return n === 1 ? "1 of your agents uses it." : `${n} of your agents use it.`;
+  }
+
+  /** Swap a button's content for a spinner and `label` while fn runs. */
+  async function withBusyLabel(button, label, fn) {
+    const saved = Array.from(button.childNodes);
+    setChildren(button, spinner(), label);
+    try {
+      return await withBusy(button, fn);
+    } finally {
+      button.replaceChildren(...saved);
+    }
+  }
+
+  /** "a, b" from a comma-separated input, cleaned the way the server cleans it, for comparing. */
+  function modelListText(value) {
+    const list = Array.isArray(value) ? value : String(value || "").split(",");
+    return list.map((m) => String(m).trim()).filter(Boolean).join(", ");
+  }
+
+  async function mountKeysTab(body, token) {
+    const list = h("div", { class: "provider-list" }, loadingRow("Loading providers…"));
+    body.append(
+      h("p", { class: "keys-intro muted" },
+        "Keys are encrypted on this server and never shown again after you save them. They are never given to your agents' containers: agents call models through this server, which adds your key to each request."),
+      list);
+
+    const render = () => {
+      const providers = state.providers || [];
+      if (!providers.length) {
+        setChildren(list, emptyBlock("This server provides the models itself, so there are no keys to add."));
+        return;
+      }
+      setChildren(list, ...providers.map((p) => (p.user_key ? providerCard(p) : platformCard(p))));
+    };
+    // After a key is removed, every card can change (counts, which providers are available).
+    const reload = async () => {
+      try {
+        await loadProviders(true);
+      } catch (err) {
+        showError(err);
+        return;
+      }
+      if (isCurrent(token)) render();
+    };
+
+    try {
+      await loadProviders(true);
+    } catch (err) {
+      if (isCurrent(token)) setChildren(list, errorBlock(err.message));
+      return;
+    }
+    if (isCurrent(token)) render();
+
+    function platformCard(p) {
+      return h("section", { class: "card provider-card" },
+        h("div", { class: "provider-head" },
+          h("h2", { text: p.label }),
+          p.available ? badge("Included", "ok") : badge("Not available", "warn")),
+        h("p", { class: "muted", text: p.description }),
+        h("div", { class: "provider-facts" },
+          h("p", { class: "provider-status" },
+            p.available
+              ? [icon("check"), h("span", { text: "Included: shared key on this server. Nothing to set up." })]
+              : h("span", { text: "Your account may not use the shared key. Switch these agents to a model from a provider below." })),
+          p.agents ? h("p", { class: "provider-status", text: agentsUsingText(p.agents) }) : null),
+        modelsLine(p));
+    }
+
+    function modelsLine(p) {
+      const models = p.models || [];
+      if (!models.length) return null;
+      return h("p", { class: "provider-models" }, "Models: ", models.map((m) => m.label).join(", "));
+    }
+
+    function providerCard(p) {
+      const key = p.key;
+      const card = h("section", { class: "card provider-card" });
+      const replaceWith = (provider) => {
+        storeProvider(provider);
+        if (isCurrent(token)) card.replaceWith(providerCard(provider));
+      };
+
+      let statusBadge;
+      let statusLine;
+      if (!key) {
+        statusBadge = badge("Not set", "muted");
+        statusLine = h("p", { class: "provider-status", text: "No key yet." });
+      } else if (!key.usable) {
+        statusBadge = badge("Can't be read", "danger");
+        statusLine = h("p", { class: "provider-status provider-status-bad" }, icon("alert"), h("span", { text: "Can't be read. Paste it again." }));
+      } else {
+        statusBadge = badge("Key saved", "ok");
+        const checked = key.verified_at || key.updated_at;
+        statusLine = h("p", { class: "provider-status" }, icon("check"),
+          h("span", null, "Key ", h("code", { class: "key-hint", text: key.hint || "" }),
+            checked ? [", checked ", timeEl(checked)] : null));
+      }
+
+      const keyInput = h("input", {
+        type: "password", autocomplete: "off", spellcheck: "false",
+        placeholder: key && key.usable ? `Paste a new key to replace ${key.hint || "the saved one"}` : p.key_placeholder || "API key",
+      });
+      // key_url comes from the server's catalog; only plain https links become links.
+      const getKey = p.key_url && /^https:\/\//i.test(p.key_url)
+        ? h("a", { class: "external-link", href: p.key_url, target: "_blank", rel: "noopener noreferrer" }, "Get a key", icon("external"))
+        : null;
+
+      let baseUrl = null;
+      let modelsInput = null;
+      let extraModels = null;
+      const savedModels = modelListText(key ? key.models : []);
+      if (p.custom_url) {
+        baseUrl = h("input", { type: "text", inputmode: "url", autocomplete: "off", spellcheck: "false", placeholder: "https://example.com/v1", value: (key && key.base_url) || "" });
+        modelsInput = h("input", { type: "text", autocomplete: "off", spellcheck: "false", placeholder: "e.g. my-model, my-other-model", value: savedModels });
+      } else {
+        extraModels = h("input", { type: "text", autocomplete: "off", spellcheck: "false", placeholder: "model-id, another-model-id", value: savedModels });
+      }
+
+      const error = h("p", { class: "form-error", role: "alert", hidden: true });
+      const showErr = (message) => { error.textContent = message; error.hidden = false; };
+      const save = h("button", { class: "btn btn-primary", type: "submit" });
+      const saveLabel = () => setChildren(save, !key || !key.usable ? "Save key" : keyInput.value.trim() ? "Replace key" : "Save changes");
+      saveLabel();
+      keyInput.addEventListener("input", saveLabel);
+      const test = key && key.usable ? h("button", { class: "btn", type: "button", text: "Test" }) : null;
+      const remove = key ? h("button", { class: "btn btn-danger-ghost", type: "button" }, icon("trash"), "Remove") : null;
+
+      const fields = h("fieldset", { class: "provider-form" },
+        p.custom_url ? field("Base URL", baseUrl, "The server's OpenAI-compatible API root, usually ending in /v1.") : null,
+        p.custom_url ? field("Model ids", modelsInput, "Comma separated: the models this server offers.") : null,
+        h("label", { class: "field" },
+          h("span", { class: "field-label-row" }, h("span", { class: "field-label", text: "API key" }), getKey),
+          keyInput),
+        extraModels ? h("details", { class: "extra-models", open: false },
+          h("summary", { text: savedModels ? `Extra models (${savedModels.split(", ").length})` : "Extra models" }),
+          field("Extra model ids", extraModels, "Comma separated. Models this provider offers that are not in the list above.")) : null,
+        error,
+        h("div", { class: "provider-actions" }, save, test, remove));
+
+      const form = h("form", { class: "provider-form-wrap", novalidate: true }, fields);
+      form.addEventListener("submit", (e) => {
+        e.preventDefault();
+        error.hidden = true;
+        const body = {};
+        const typed = keyInput.value.trim();
+        if (typed) body.api_key = typed;
+        else if (!key) { showErr("Paste the API key."); keyInput.focus(); return; }
+        if (p.custom_url) {
+          body.base_url = baseUrl.value.trim();
+          body.models = modelsInput.value;
+          if (!body.base_url) { showErr("Enter the server's base URL."); baseUrl.focus(); return; }
+          if (!modelListText(body.models)) { showErr("List at least one model id this server offers."); modelsInput.focus(); return; }
+        } else if (modelListText(extraModels.value) !== savedModels) {
+          body.models = extraModels.value;
+        }
+        if (key && !typed && Object.keys(body).length === 0) {
+          showErr("Paste a new key, or change the models, then save.");
+          return;
+        }
+        // The server checks the key with the provider before saving; that can take a few seconds.
+        fields.disabled = true;
+        withBusyLabel(save, "Checking key…", async () => {
+          try {
+            const res = await api("PUT", `/api/providers/${enc(p.id)}/key`, body);
+            toast(`${p.label}: key saved and working.`, "ok");
+            replaceWith(res.provider);
+          } catch (err) {
+            if (err.status === 401) return;
+            showErr(err.message);
+          } finally {
+            fields.disabled = false;
+          }
+        });
+      });
+
+      if (test) {
+        test.addEventListener("click", () => {
+          error.hidden = true;
+          fields.disabled = true;
+          withBusyLabel(test, "Testing…", async () => {
+            try {
+              const res = await api("POST", `/api/providers/${enc(p.id)}/key/test`);
+              if (res.ok) {
+                toast(`${p.label}: ${res.message || "The key works."}`, "ok");
+                replaceWith(res.provider);
+              } else {
+                showErr(res.message || "The key did not work.");
+                storeProvider(res.provider);
+              }
+            } catch (err) {
+              if (err.status !== 401) showErr(err.message);
+            } finally {
+              fields.disabled = false;
+            }
+          });
+        });
+      }
+
+      if (remove) {
+        remove.addEventListener("click", () => {
+          const warning = p.agents
+            ? `Remove your ${p.label} key?\n\n${agentsUsingText(p.agents)} ${p.agents === 1 ? "It stops" : "They stop"} working until you add a key again or switch ${p.agents === 1 ? "it" : "them"} to another model.`
+            : `Remove your ${p.label} key?`;
+          if (!window.confirm(warning)) return;
+          error.hidden = true;
+          withBusy(remove, async () => {
+            try {
+              await api("DELETE", `/api/providers/${enc(p.id)}/key`);
+              toast(`${p.label} key removed.`, "ok");
+              await reload();
+            } catch (err) {
+              if (err.status !== 401) showErr(err.message);
+            }
+          });
+        });
+      }
+
+      return appendAll(card,
+        [h("div", { class: "provider-head" }, h("h2", { text: p.label }), statusBadge),
+          p.description ? h("p", { class: "muted", text: p.description }) : null,
+          h("div", { class: "provider-facts" }, statusLine,
+            p.agents ? h("p", { class: "provider-status", text: agentsUsingText(p.agents) }) : null),
+          modelsLine(p),
+          form]);
+    }
+  }
+
+  // ---- usage --------------------------------------------------------------
+
+  const intFormat = new Intl.NumberFormat();
+
+  function fmtInt(n) {
+    return intFormat.format(Number(n) || 0);
+  }
+
+  function fmtUsd(value) {
+    if (value === null || value === undefined) return "—";
+    const n = Number(value);
+    if (n === 0) return "$0.00";
+    if (n < 0.01) return "< $0.01";
+    return `$${n.toFixed(2)}`;
+  }
+
+  async function mountUsageTab(body, token) {
+    const card = h("section", { class: "card usage-card" }, loadingRow("Loading usage…"));
+    body.appendChild(card);
+    let res;
+    try {
+      // Providers only supply model names; the table shows ids without them.
+      [res] = await Promise.all([api("GET", withQuery("/api/usage", { days: 30 })), loadProviders().catch(() => null)]);
+    } catch (err) {
+      if (isCurrent(token)) setChildren(card, errorBlock(err.message));
+      return;
+    }
+    if (!isCurrent(token)) return;
+    const rows = (res && res.by_model) || [];
+    const days = (res && res.days) || 30;
+    const head = h("div", { class: "usage-head" },
+      h("h2", { text: `Last ${days} days` }),
+      res && res.since ? h("span", { class: "muted small", text: `Since ${fmtDateTime(res.since)}` }) : null);
+    if (!rows.length) {
+      setChildren(card, head, emptyBlock("No model usage yet. It shows up here once your agents answer messages or run jobs."));
+      return;
+    }
+
+    const totals = { requests: 0, input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 };
+    for (const r of rows) for (const k of Object.keys(totals)) totals[k] += Number(r[k]) || 0;
+    const anyCost = rows.some((r) => r.estimated_usd !== null && r.estimated_usd !== undefined);
+    const num = (text, extra) => h("td", { class: extra ? `num ${extra}` : "num", text });
+
+    const table = h("table", { class: "data-table" },
+      h("thead", null, h("tr", null,
+        h("th", { scope: "col", text: "Model" }),
+        h("th", { scope: "col", text: "Requests" }),
+        h("th", { scope: "col", text: "Input" }),
+        h("th", { scope: "col", class: "col-cached", text: "Cached", title: "Input tokens read from the provider's prompt cache" }),
+        h("th", { scope: "col", text: "Output" }),
+        h("th", { scope: "col", text: "Cost", title: "Estimated cost at list prices" }))),
+      h("tbody", null, rows.map((r) => h("tr", null,
+        h("td", null, h("div", { class: "usage-model" },
+          h("span", { class: "usage-model-name", text: modelLabel(r.model, r.provider) }),
+          h("span", { class: "usage-provider", text: r.provider_label || r.provider || "" }))),
+        num(fmtInt(r.requests)),
+        num(fmtInt(r.input_tokens)),
+        num(fmtInt(r.cached_input_tokens), "col-cached"),
+        num(fmtInt(r.output_tokens)),
+        num(fmtUsd(r.estimated_usd))))),
+      h("tfoot", null, h("tr", null,
+        h("td", { text: "Total" }),
+        num(fmtInt(totals.requests)),
+        num(fmtInt(totals.input_tokens)),
+        num(fmtInt(totals.cached_input_tokens), "col-cached"),
+        num(fmtInt(totals.output_tokens)),
+        num(fmtUsd(res.estimated_usd)))));
+
+    setChildren(card, head,
+      h("div", { class: "table-wrap" }, table),
+      h("p", { class: "muted small" },
+        anyCost
+          ? "Costs are estimates at list prices and are only shown for Claude models; the total covers those models. Your provider's bill is the real amount."
+          : "Costs are estimates at list prices and are only shown for Claude models."));
+  }
+
+  // ---- account ------------------------------------------------------------
+
+  function mountAccountTab(body) {
+    const user = state.user || {};
+
+    // Change password
+    const current = h("input", { type: "password", autocomplete: "current-password", required: true });
+    const next = h("input", { type: "password", autocomplete: "new-password", required: true, minlength: 8, maxlength: 200 });
+    const again = h("input", { type: "password", autocomplete: "new-password", required: true, minlength: 8, maxlength: 200 });
+    const pwError = h("p", { class: "form-error", role: "alert", hidden: true });
+    const pwSave = h("button", { class: "btn btn-primary", type: "submit", text: "Change password" });
+    const pwForm = h("form", { class: "stack" },
+      // Lets password managers file the new password under the right account.
+      h("input", { type: "email", autocomplete: "username", value: user.email || "", hidden: true, readOnly: true, tabindex: "-1" }),
+      field("Current password", current),
+      field("New password", next, "At least 8 characters."),
+      field("New password again", again),
+      pwError,
+      h("div", { class: "form-actions" }, pwSave));
+    pwForm.addEventListener("submit", (e) => {
+      e.preventDefault();
+      pwError.hidden = true;
+      if (next.value !== again.value) { pwError.textContent = "The new passwords do not match."; pwError.hidden = false; return; }
+      withBusy(pwSave, async () => {
+        try {
+          await api("POST", "/api/auth/password", { current_password: current.value, new_password: next.value });
+          pwForm.reset();
+          toast("Password changed. Your other sessions were signed out.", "ok");
+        } catch (err) {
+          if (err.status === 401) return;
+          pwError.textContent = err.message;
+          pwError.hidden = false;
+        }
+      });
+    });
+
+    // Delete account: needs the password and a ticked box.
+    const delPassword = h("input", { type: "password", autocomplete: "current-password", required: true });
+    const understand = h("input", { type: "checkbox" });
+    const delError = h("p", { class: "form-error", role: "alert", hidden: true });
+    const delBtn = h("button", { class: "btn btn-danger", type: "submit", disabled: true }, icon("trash"), "Delete my account");
+    const syncDelete = () => { delBtn.disabled = !(understand.checked && delPassword.value); };
+    understand.addEventListener("change", syncDelete);
+    delPassword.addEventListener("input", syncDelete);
+    const delForm = h("form", { class: "stack" },
+      field("Your password", delPassword),
+      h("label", { class: "check-row" }, understand,
+        h("span", { text: "I understand that my agents, their files, conversations and jobs, my API keys and my usage history are deleted for good." })),
+      delError,
+      h("div", { class: "form-actions" }, delBtn));
+    delForm.addEventListener("submit", (e) => {
+      e.preventDefault();
+      delError.hidden = true;
+      if (!understand.checked || !delPassword.value) return;
+      withBusyLabel(delBtn, "Deleting…", async () => {
+        try {
+          await api("POST", "/api/auth/delete-account", { password: delPassword.value });
+        } catch (err) {
+          if (err.status === 401) return;
+          delError.textContent = err.message;
+          delError.hidden = false;
+          return;
+        }
+        state.user = null;
+        state.providers = null;
+        closeSession();
+        renderUserBox();
+        toast("Your account was deleted.", "info");
+        go("#/login");
+      }).finally(syncDelete);
+    });
+
+    body.append(
+      h("section", { class: "card account-card" },
+        h("h2", { text: "Account" }),
+        h("dl", { class: "facts" },
+          h("div", null, h("dt", { text: "Email" }), h("dd", { text: user.email || "" })),
+          user.timezone ? h("div", null, h("dt", { text: "Timezone" }), h("dd", { text: user.timezone })) : null)),
+      h("section", { class: "card account-card" },
+        h("h2", { text: "Change password" }),
+        h("p", { class: "muted small", text: "Other browsers signed in to this account are signed out. This one stays signed in." }),
+        pwForm),
+      h("section", { class: "card account-card danger-card" },
+        h("h2", { text: "Delete account" }),
+        h("p", { class: "muted small", text: "Removes every agent with its container, files, conversation and jobs, plus your API keys and usage. This cannot be undone." }),
+        delForm));
+  }
+
+  // ======================================================================
+  // 13. Boot
   // ======================================================================
 
   // ---- Light and dark theme ----------------------------------------------
@@ -3219,6 +3819,7 @@
   async function boot() {
     initTheme();
     document.getElementById("logout-btn").addEventListener("click", logout);
+    document.getElementById("settings-link").prepend(icon("gear"));
     window.addEventListener("hashchange", route);
     const root = document.getElementById("app");
     setChildren(root, loadingRow("Loading…"));
