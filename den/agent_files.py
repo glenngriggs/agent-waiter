@@ -105,7 +105,7 @@ def developer_instructions(
     if purpose == "probe":
         return "This is a connectivity check. Reply with the single word: ready."
     parts = [
-        f"You are {agent_name}, a personal AI assistant on the Den platform, working for one user.",
+        f"You are {agent_name}, a personal AI assistant on the AgentWaiter platform, working for one user.",
         "You run in your own isolated container. Your current working directory is the user's "
         "workspace: the user can browse, open, upload and download the files there, so save "
         "anything the user should see in it.",

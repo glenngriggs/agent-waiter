@@ -1,5 +1,5 @@
 /*
- * Den web client styles. Light theme, system font, no external assets.
+ * AgentWaiter web client styles. Light theme, system font, no external assets.
  * Sections: tokens, base, header, controls, feedback, layout, agents, onboarding,
  * agent page, chat timeline, composer, files, jobs, dialog, responsive.
  */
@@ -28,8 +28,8 @@
   --danger: #c92a2a;
   --danger-soft: #fdecec;
   --danger-border: #f3b8b8;
-  --agent: #7048b6;
-  --agent-soft: #f2ecfb;
+  --agent: #4a5563;
+  --agent-soft: #eef0f3;
   --code-bg: #0f1720;
   --code-text: #e6edf3;
   --radius: 10px;
@@ -87,18 +87,12 @@ code, pre, .mono { font-family: var(--mono); font-size: 0.86em; }
   position: sticky; top: 0; z-index: 20;
   display: flex; align-items: center; justify-content: space-between; gap: 12px;
   padding: 10px max(16px, calc((100vw - var(--content)) / 2));
-  background: rgba(255, 255, 255, 0.92);
-  backdrop-filter: saturate(1.4) blur(8px);
+  background: var(--surface);
   border-bottom: 1px solid var(--border);
 }
-.brand { display: inline-flex; align-items: center; gap: 9px; color: var(--text); font-weight: 700; font-size: 1.1rem; }
+.brand { display: inline-flex; align-items: center; gap: 8px; color: var(--text); font-weight: 700; font-size: 1.1rem; letter-spacing: -0.01em; }
 .brand:hover { text-decoration: none; }
-.brand-mark {
-  display: inline-grid; place-items: center;
-  width: 30px; height: 30px; border-radius: 8px;
-  background: linear-gradient(135deg, #4c6ef5, #7048b6);
-  color: #fff; font-size: 0.95rem;
-}
+.brand-mark { width: 22px; height: 22px; flex: none; color: var(--text); }
 .user-box { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .user-email { color: var(--text-2); font-size: 0.875rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
@@ -214,8 +208,13 @@ textarea { resize: vertical; }
 .section-title { margin: 20px 0 10px; }
 .avatar {
   display: inline-grid; place-items: center; flex: none;
-  width: 38px; height: 38px; border-radius: 10px;
-  color: #fff; font-weight: 700; font-size: 1rem;
+  width: 38px; height: 38px; border-radius: var(--radius-sm);
+  background: var(--surface-2); border: 1px solid var(--border);
+  color: var(--text-2); font-weight: 650; font-size: 1rem;
+}
+/* Per-agent tint: app.js sets --hue from the agent's id; pale fill, darker letter of the same hue. */
+.avatar-tint {
+  background: hsl(var(--hue) 75% 94%); border-color: hsl(var(--hue) 50% 82%); color: hsl(var(--hue) 60% 33%);
 }
 
 /* ---------- auth ---------- */
@@ -227,9 +226,9 @@ textarea { resize: vertical; }
 .agent-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 14px; }
 .agent-card {
   display: flex; flex-direction: column; gap: 12px; color: var(--text);
-  transition: border-color 0.12s, box-shadow 0.12s, transform 0.12s;
+  transition: border-color 0.12s;
 }
-.agent-card:hover { text-decoration: none; border-color: var(--border-strong); box-shadow: 0 4px 14px rgba(16, 24, 40, 0.08); transform: translateY(-1px); }
+.agent-card:hover { text-decoration: none; border-color: var(--border-strong); }
 .agent-card-top { display: flex; align-items: center; gap: 12px; min-width: 0; }
 .agent-card-title { display: flex; flex-direction: column; min-width: 0; }
 .agent-card-title h2 { font-size: 1.05rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -292,7 +291,7 @@ textarea { resize: vertical; }
 .agent-actions { display: flex; flex-wrap: wrap; gap: 6px; }
 .conn { display: inline-flex; align-items: center; gap: 6px; color: var(--text-3); font-size: 0.8rem; }
 .conn i { width: 8px; height: 8px; border-radius: 50%; background: var(--text-3); }
-.conn-live i { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft); }
+.conn-live i { background: var(--ok); }
 .conn-connecting i, .conn-reconnecting i { background: #e0a100; }
 .conn-offline { color: var(--danger); }
 .conn-offline i { background: var(--danger); }
@@ -330,18 +329,29 @@ textarea { resize: vertical; }
 .bubble { padding: 10px 14px; border-radius: 14px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .msg-user .bubble { background: var(--accent); color: #fff; border-bottom-right-radius: 4px; }
 .msg-agent .bubble { background: var(--surface-2); border-bottom-left-radius: 4px; }
-.msg-prompt .bubble { background: var(--agent-soft); border: 1px solid #e0d4f5; }
+.msg-prompt .bubble { background: var(--agent-soft); border: 1px solid var(--border); }
 .msg-label { display: flex; align-items: center; gap: 6px; color: var(--agent); font-size: 0.8rem; font-weight: 600; margin-bottom: 4px; }
 .msg-meta { color: var(--text-3); font-size: 0.75rem; margin-top: 3px; }
-.msg-agent.streaming .bubble::after {
-  content: ""; display: inline-block; width: 7px; height: 1em; margin-left: 2px; vertical-align: -0.15em;
-  background: var(--text-2); animation: blink 1s steps(2) infinite;
-}
-@keyframes blink { 50% { opacity: 0; } }
 .rich .code-block {
-  white-space: pre; overflow-x: auto; margin: 8px 0; padding: 10px 12px;
-  background: var(--code-bg); color: var(--code-text); border-radius: var(--radius-sm); font-size: 0.82rem;
+  white-space: pre; overflow-x: auto; margin: 8px 0; padding: 14px 18px;
+  background: var(--surface); color: #1f2328; border: 1px solid var(--border);
+  border-radius: var(--radius); font-size: calc(1em + 1px); line-height: 1.6; /* a touch larger than the message text */
 }
+.rich .code-block code { font-size: inherit; }
+/* The fence's language (```cpp) as a small muted label above the code. */
+.rich .code-block[data-lang]::before {
+  content: attr(data-lang); display: block; margin-bottom: 12px;
+  font-family: var(--font); font-size: 0.75rem; color: var(--text-3);
+}
+/* Syntax colours (filled in by highlightCode in app.js): the VS Code "Light+" palette. */
+.tok-kw, .tok-lit { color: #0000ff; }
+.tok-ctl { color: #af00db; }
+.tok-type { color: #267f99; }
+.tok-fn { color: #795e26; }
+.tok-var { color: #001080; }
+.tok-str { color: #a31515; }
+.tok-num { color: #098658; }
+.tok-com { color: #008000; }
 .inline-code { background: rgba(27, 31, 36, 0.08); padding: 1px 5px; border-radius: 4px; }
 
 .thinking { display: flex; align-items: center; gap: 8px; color: var(--text-3); font-size: 0.85rem; }
@@ -349,11 +359,6 @@ textarea { resize: vertical; }
 .thinking-done summary { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
 .thinking-text { white-space: pre-wrap; margin-top: 6px; padding-left: 12px; border-left: 2px solid var(--border); color: var(--text-2); }
 
-.typing { display: inline-flex; gap: 3px; }
-.typing i { width: 6px; height: 6px; border-radius: 50%; background: var(--text-3); animation: bounce 1.2s infinite ease-in-out; }
-.typing i:nth-child(2) { animation-delay: 0.15s; }
-.typing i:nth-child(3) { animation-delay: 0.3s; }
-@keyframes bounce { 0%, 80%, 100% { transform: translateY(0); opacity: 0.5; } 40% { transform: translateY(-4px); opacity: 1; } }
 .working { display: flex; align-items: center; gap: 10px; color: var(--text-2); font-size: 0.875rem; }
 
 /* tool rows: commands, file changes, MCP calls */
@@ -628,5 +633,6 @@ textarea { resize: vertical; }
 .bubble.rich blockquote { margin: 6px 0; padding: 2px 0 2px 10px; border-left: 3px solid var(--border, #d0d5dd); color: var(--muted, #5b6472); }
 .bubble.rich hr { border: 0; border-top: 1px solid var(--border, #d0d5dd); margin: 10px 0; }
 .bubble.rich .code-block { white-space: pre; overflow-x: auto; margin: 6px 0 8px; }
+.bubble.rich > .code-block:last-child { margin-bottom: 0; }
 .bubble.rich a.md-link { color: var(--accent, #3b5bdb); text-decoration: underline; text-underline-offset: 2px; overflow-wrap: anywhere; }
 .msg-user .bubble.rich a.md-link { color: #fff; }

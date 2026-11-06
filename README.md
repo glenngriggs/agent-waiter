@@ -1,6 +1,6 @@
-# Den
+# AgentWaiter
 
-Den is a cloud platform for personal AI agents. Anyone can sign up in the browser, create one or more agents (pick a name and a model), chat with them, watch what they are doing, stop them, browse their files, and give them scheduled jobs. Agents can schedule their own follow-up jobs too.
+AgentWaiter is a cloud platform for personal AI agents. Anyone can sign up in the browser, create one or more agents (pick a name and a model), chat with them, watch what they are doing, stop them, browse their files, and give them scheduled jobs. Agents can schedule their own follow-up jobs too.
 
 Each agent runs in its own Docker container, and **Codex app server** is the harness inside it. The backend drives it through the official Codex Python SDK.
 
@@ -10,7 +10,7 @@ Each agent runs in its own Docker container, and **Codex app server** is the har
 ## How it fits together
 
 ```
-browser ──▶ Den backend (FastAPI, one process) ──docker exec──▶ codex app-server (one container per agent)
+browser ──▶ AgentWaiter backend (FastAPI, one process) ──docker exec──▶ codex app-server (one container per agent)
              │  SQLite, SSE, scheduler                               │
              │◀──── /model-proxy (holds the real key) ◀──────────────┤
              │◀──── /mcp (schedule_job, list_jobs, cancel_job) ◀─────┘

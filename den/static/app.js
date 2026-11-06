@@ -1,7 +1,7 @@
 /*
- * Den web client: plain JavaScript, no framework, no build step, no CDN.
+ * AgentWaiter web client: plain JavaScript, no framework, no build step, no CDN.
  *
- * It talks only to the Den backend (docs/designs/agent-platform.md, sections 4.1 and 4.3).
+ * It talks only to the AgentWaiter backend (docs/designs/agent-platform.md, sections 4.1 and 4.3).
  * Rules this file keeps everywhere:
  *   - The DOM is built with createElement + textContent (the h() helper below). innerHTML is
  *     never used, so text written by agents, files or other users cannot inject markup or script.
@@ -92,7 +92,7 @@
     clock: "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM12 7v5l3 2",
     alert: "M12 3l10 18H2zM12 10v4M12 17.5v.5",
     search: "M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14zM20 20l-4-4",
-    sparkle: "M12 3v4M12 17v4M3 12h4M17 12h4M6 6l2.5 2.5M15.5 15.5L18 18M18 6l-2.5 2.5M8.5 15.5L6 18",
+    note: "M5 6h14M5 11h14M5 16h9",
     refresh: "M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7",
     chevron: "M9 6l6 6-6 6",
   };
@@ -177,11 +177,12 @@
   }
 
   function avatar(name, id) {
-    // A stable colour per agent so cards are easy to tell apart.
+    // Any hue, picked from the agent's id so it stays the same across visits.
+    // style.css (.avatar-tint) turns the hue into a pale fill and a darker letter.
     let hash = 0;
     for (const ch of String(id || name)) hash = (hash * 31 + ch.charCodeAt(0)) >>> 0;
     const initial = (String(name || "?").trim()[0] || "?").toUpperCase();
-    return h("span", { class: "avatar", style: { backgroundColor: `hsl(${hash % 360} 55% 46%)` }, text: initial, "aria-hidden": "true" });
+    return h("span", { class: "avatar avatar-tint", style: `--hue: ${(hash * 137) % 360}`, text: initial, "aria-hidden": "true" });
   }
 
   // ======================================================================
@@ -359,7 +360,7 @@
       res = await fetch(path, { method, headers, body: payload, credentials: "same-origin" });
     } catch (err) {
       console.error(`${method} ${path} failed`, err);
-      throw new ApiError("Could not reach the Den server. Check that it is running, then try again.", 0, null);
+      throw new ApiError("Could not reach the AgentWaiter server. Check that it is running, then try again.", 0, null);
     }
     let data = null;
     if (res.status !== 204 && (res.headers.get("content-type") || "").includes("application/json")) {
@@ -512,7 +513,7 @@
 
     const root = document.getElementById("app");
     root.replaceChildren();
-    document.title = "Den";
+    document.title = "AgentWaiter";
 
     let view;
     if (page === "login") view = viewLogin(root);
@@ -530,7 +531,7 @@
   function viewNotFound(root) {
     root.appendChild(h("div", { class: "card narrow center" },
       h("h1", { text: "Page not found" }),
-      h("p", { class: "muted", text: "That address does not match anything in Den." }),
+      h("p", { class: "muted", text: "That address does not match anything in AgentWaiter." }),
       h("a", { class: "btn btn-primary", href: "#/agents", text: "Go to your agents" })));
   }
 
@@ -568,7 +569,7 @@
   }
 
   function viewLogin(root) {
-    document.title = "Sign in · Den";
+    document.title = "Sign in · AgentWaiter";
     const email = h("input", { type: "email", name: "email", autocomplete: "username", required: true });
     const password = h("input", { type: "password", name: "password", autocomplete: "current-password", required: true });
     const error = h("p", { class: "form-error", role: "alert", hidden: true });
@@ -589,13 +590,13 @@
         });
       },
     }, field("Email", email), field("Password", password), error, submit);
-    root.appendChild(authShell("Welcome back", "Sign in to talk to your agents.", form,
-      h("p", { class: "auth-switch" }, "New to Den? ", h("a", { href: "#/register", text: "Create an account" }))));
+    root.appendChild(authShell("Sign in", "Use the email and password you registered with.", form,
+      h("p", { class: "auth-switch" }, "No account yet? ", h("a", { href: "#/register", text: "Create an account" }))));
     email.focus();
   }
 
   function viewRegister(root) {
-    document.title = "Create account · Den";
+    document.title = "Create account · AgentWaiter";
     const tz = userTimezone();
     const email = h("input", { type: "email", name: "email", autocomplete: "username", required: true });
     const password = h("input", { type: "password", name: "password", autocomplete: "new-password", required: true, minlength: 8, maxlength: 200 });
@@ -622,7 +623,7 @@
     field("Password", password, "At least 8 characters."),
     h("p", { class: "muted small", text: `Your timezone is ${tz}. Job schedules use it.` }),
     error, submit);
-    root.appendChild(authShell("Create your account", "Then set up your first agent in under a minute.", form,
+    root.appendChild(authShell("Create an account", "You can set up an agent once you are signed in.", form,
       h("p", { class: "auth-switch" }, "Already have an account? ", h("a", { href: "#/login", text: "Sign in" }))));
     email.focus();
   }
@@ -630,7 +631,7 @@
   // ---- agents list ------------------------------------------------------
 
   async function viewAgents(root, token) {
-    document.title = "Agents · Den";
+    document.title = "Agents · AgentWaiter";
     const list = h("div", { class: "agent-grid" }, loadingRow("Loading your agents…"));
     const newBtn = h("a", { class: "btn btn-primary", href: "#/new" }, icon("plus"), "New agent");
     const limitNote = h("p", { class: "muted small", hidden: true });
@@ -670,8 +671,8 @@
       if (!agents.length) {
         setChildren(list, h("div", { class: "card empty-hero" },
           h("h2", { text: "No agents yet" }),
-          h("p", { class: "muted", text: "Create an agent, give it a name and a model, and start chatting. It keeps working when you close the tab." }),
-          h("a", { class: "btn btn-primary", href: "#/new" }, icon("plus"), "Create your first agent")));
+          h("p", { class: "muted", text: "Create an agent to get started. Each one runs in its own container and keeps working when you close the tab." }),
+          h("a", { class: "btn btn-primary", href: "#/new" }, icon("plus"), "New agent")));
       } else {
         setChildren(list, ...agents.map(agentCard));
       }
@@ -723,7 +724,7 @@
   // ---- new agent ----------------------------------------------------------
 
   function viewNewAgent(root, token) {
-    document.title = "New agent · Den";
+    document.title = "New agent · AgentWaiter";
     const name = h("input", { type: "text", maxlength: 40, required: true, placeholder: "e.g. Research helper", autocomplete: "off" });
     const picker = modelPicker(null, "new-agent-model");
     const error = h("p", { class: "form-error", role: "alert", hidden: true });
@@ -757,7 +758,7 @@
 
     card.append(
       h("h1", { text: "Create an agent" }),
-      h("p", { class: "muted", text: "Your agent gets its own container, a workspace for files, and a model to think with." }),
+      h("p", { class: "muted", text: "Pick a name and a model. The agent gets its own container and a workspace for files." }),
       form);
     root.appendChild(card);
     name.focus();
@@ -935,7 +936,7 @@
       this.timeline = new Timeline({
         agentId,
         mode: "chat",
-        emptyText: "No messages yet. Say hello, or ask the agent to do something in its workspace.",
+        emptyText: "No messages yet. Ask the agent to do something in its workspace.",
         actions: {
           newConversation: (button) => newConversation(this, button),
           switchModel: () => openSettings(this, { focusModel: true }),
@@ -1256,6 +1257,76 @@
     other: "Turn failed",
   };
 
+  // ---- Syntax colouring for fenced code -----------------------------------
+  // A small tokenizer, not a parser: comments, strings, numbers, keywords,
+  // type names and function calls get a class, everything else stays plain.
+  // Keywords for the common languages are merged into one set; a word that
+  // is a keyword in one language and a name in another rarely matters for
+  // colouring. Built from text nodes only, like the Markdown renderer.
+
+  // Control flow and imports get their own colour, as in most editor themes.
+  const HL_CONTROL = new Set((
+    "break case catch continue default do else for goto if return switch throw try while yield await " +
+    "import export from elif except finally raise pass with match loop defer go"
+  ).split(" "));
+  const HL_KEYWORDS = new Set((
+    "auto class const constexpr delete enum explicit extends extern final friend implements inline " +
+    "interface namespace new noexcept operator override private protected public sizeof static struct " +
+    "template this throws typedef typename union using virtual volatile async function let var " +
+    "instanceof typeof def global lambda nonlocal as is not and or in del assert fn mut impl pub use " +
+    "mod trait crate dyn func chan package"
+  ).split(" "));
+  const HL_LITERALS = new Set("true false null nullptr NULL None True False undefined nil self".split(" "));
+  const HL_TYPES = new Set((
+    "int long short char float double bool boolean void unsigned signed size_t string str byte " +
+    "vector map set unordered_map unordered_set priority_queue queue stack deque pair list dict tuple " +
+    "array optional shared_ptr unique_ptr i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 usize isize"
+  ).split(" "));
+  // Languages whose comments start with "#". The rest use // and /* */.
+  const HL_HASH = new Set("python py sh bash shell zsh ruby rb yaml yml toml r perl dockerfile makefile ini conf".split(" "));
+  // Fences that are output or prose, not code: shown uncoloured.
+  const HL_PLAIN = new Set("text txt plain plaintext output console log logs".split(" "));
+  const HL_STRING = /"""[\s\S]*?(?:"""|$)|'''[\s\S]*?(?:'''|$)|"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|`(?:[^`\\]|\\.)*`/.source;
+  const HL_NUMBER = /\b(?:0[xX][\da-fA-F_]+|\d[\d_]*(?:\.\d+)?(?:[eE][+-]?\d+)?)[a-zA-Z]*\b/.source;
+
+  function hlRegex(hashComments) {
+    return new RegExp([
+      hashComments ? /(#[^\n]*)/.source : /(\/\/[^\n]*|\/\*[\s\S]*?(?:\*\/|$))/.source,
+      `(${HL_STRING})`,
+      `(${HL_NUMBER})`,
+      hashComments ? "((?!))" : /(^[ \t]*#[ \t]*[a-z]+\b)/.source, // C preprocessor: #include
+      /([A-Za-z_$][\w$]*)/.source,
+    ].join("|"), "gm");
+  }
+
+  /** A <code> element for `text`, coloured when `lang` names a programming language. */
+  function highlightCode(text, lang) {
+    const code = h("code");
+    if (!lang || HL_PLAIN.has(lang)) { code.textContent = text; return code; }
+    const re = hlRegex(HL_HASH.has(lang));
+    const span = (cls, str) => code.appendChild(h("span", { class: `tok-${cls}`, text: str }));
+    let last = 0;
+    for (let m; (m = re.exec(text)); ) {
+      if (m.index > last) code.appendChild(document.createTextNode(text.slice(last, m.index)));
+      last = re.lastIndex;
+      if (m[1]) span("com", m[1]);
+      else if (m[2]) span("str", m[2]);
+      else if (m[3]) span("num", m[3]);
+      else if (m[4]) span("ctl", m[4]);
+      else {
+        const word = m[5];
+        if (HL_CONTROL.has(word)) span("ctl", word);
+        else if (HL_KEYWORDS.has(word)) span("kw", word);
+        else if (HL_LITERALS.has(word)) span("lit", word);
+        else if (HL_TYPES.has(word) || /_t$/.test(word) || (/^[A-Z]/.test(word) && /[a-z]/.test(word))) span("type", word);
+        else if (/^\s*\(/.test(text.slice(last, last + 40))) span("fn", word);
+        else span("var", word);
+      }
+    }
+    if (last < text.length) code.appendChild(document.createTextNode(text.slice(last)));
+    return code;
+  }
+
   // ---- Markdown for agent messages --------------------------------------
   // A deliberately small Markdown subset (what models actually write):
   // fenced code, headings, bullet and numbered lists, quotes, rules,
@@ -1290,8 +1361,9 @@
         i += 1;
         while (i < lines.length && !/^\s*```\s*$/.test(lines[i])) body.push(lines[i++]);
         i += 1; // skip the closing fence (or run off the end while streaming)
-        const pre = h("pre", { class: "code-block" }, h("code", { text: body.join("\n") }));
-        if (m[1].trim()) pre.dataset.lang = m[1].trim();
+        const lang = (m[1].trim().split(/\s+/)[0] || "").toLowerCase();
+        const pre = h("pre", { class: "code-block" }, highlightCode(body.join("\n"), lang));
+        if (lang) pre.dataset.lang = lang;
         el.appendChild(pre);
         continue;
       }
@@ -1465,7 +1537,7 @@
       this.done = false;
       this.visible = true;
       this.text = "";
-      this.el = h("div", { class: "thinking" }, h("span", { class: "typing" }, h("i"), h("i"), h("i")), h("span", { text: "Thinking…" }));
+      this.el = h("div", { class: "thinking" }, spinner(), h("span", { text: "Thinking…" }));
     }
     update(d, completed) {
       if (!completed) return;
@@ -1479,7 +1551,7 @@
         return;
       }
       const details = h("details", { class: "thinking thinking-done" },
-        h("summary", null, icon("sparkle"), "Thought"),
+        h("summary", null, icon("note"), "Thought"),
         h("p", { class: "thinking-text", text }));
       this.el.replaceWith(details);
       this.el = details;
@@ -1659,7 +1731,7 @@
       this.visible = true;
       this.label = h("span");
       this.badges = h("span", { class: "tool-badges" });
-      this.el = h("div", { class: "tool-line" }, icon(kind === "web_search" ? "search" : "sparkle", "tool-kind"), this.label, this.badges);
+      this.el = h("div", { class: "tool-line" }, icon(kind === "web_search" ? "search" : "box", "tool-kind"), this.label, this.badges);
     }
     update(d, completed) {
       this.done = completed;
@@ -1752,7 +1824,7 @@
       this.root = h("div", { class: `timeline timeline-${opts.mode}`, role: "log" });
       this.emptyEl = h("div", { class: "timeline-empty", text: opts.emptyText || "Nothing here yet." });
       this.workingLabel = h("span", { class: "working-label", text: "Working…" });
-      this.workingEl = h("div", { class: "working" }, h("span", { class: "typing" }, h("i"), h("i"), h("i")), this.workingLabel);
+      this.workingEl = h("div", { class: "working" }, spinner(), this.workingLabel);
       this.working = false;
       this.items = new Map();       // "<turn id>:<item id>" -> entry
       this.turns = new Map();       // turn id -> per-turn state (see turn())
@@ -2089,7 +2161,7 @@
     if (!isCurrent(token) || state.session !== session) return;
 
     const agent = session.agent;
-    document.title = `${agent.name} · Den`;
+    document.title = `${agent.name} · AgentWaiter`;
     const page = h("div", { class: "agent-page" }, agentHeader(session));
     setChildren(root, page);
 
@@ -2577,7 +2649,7 @@
     function openEntry(e) {
       if (e.type === "dir") go(filesHash(agentId, e.path));
       else if (e.type === "file") showPreview(e.path, false);
-      else if (e.type === "symlink") toast("This is a link the agent created. Den never follows links, so it cannot be opened here. You can delete it.", "info");
+      else if (e.type === "symlink") toast("This is a link the agent created. AgentWaiter never follows links, so it cannot be opened here. You can delete it.", "info");
       else toast("This is a special file and cannot be opened.", "info");
     }
 
@@ -3096,13 +3168,13 @@
     document.getElementById("logout-btn").addEventListener("click", logout);
     window.addEventListener("hashchange", route);
     const root = document.getElementById("app");
-    setChildren(root, loadingRow("Loading Den…"));
+    setChildren(root, loadingRow("Loading…"));
     try {
       state.config = await api("GET", "/api/config", undefined, { allow401: true });
     } catch (err) {
       console.error("Could not load /api/config", err);
       setChildren(root, h("div", { class: "card narrow center" },
-        h("h1", { text: "Den is not reachable" }),
+        h("h1", { text: "AgentWaiter is not reachable" }),
         h("p", { class: "muted", text: err.message }),
         h("button", { class: "btn btn-primary", type: "button", text: "Try again", onclick: () => window.location.reload() })));
       return;

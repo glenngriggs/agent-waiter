@@ -159,7 +159,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             timeout=httpx.Timeout(connect=10, read=600, write=60, pool=10)
         )
         logger.info(
-            "Den started: runtime=%s model_auth=%s data_dir=%s",
+            "AgentWaiter started: runtime=%s model_auth=%s data_dir=%s",
             settings.runtime, settings.model_auth, settings.data_dir,
         )
         try:
@@ -167,7 +167,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         finally:
             await _shutdown(ctx, scheduler, prepare_task, reaper_task)
 
-    app = FastAPI(title="Den", lifespan=lifespan)
+    app = FastAPI(title="AgentWaiter", lifespan=lifespan)
     app.state.settings = settings
     app.add_middleware(CSRFMiddleware)
 
@@ -217,4 +217,4 @@ async def _shutdown(
         await asyncio.gather(*pending, return_exceptions=True)
     await ctx.http.aclose()
     ctx.db.close()
-    logger.info("Den stopped")
+    logger.info("AgentWaiter stopped")
