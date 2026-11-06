@@ -44,6 +44,9 @@ MAX_ONCE_AHEAD = timedelta(days=366)
 # submit). The same slack decides whether a run counts as "late".
 PAST_SLACK = timedelta(seconds=60)
 CRON_CHECK_OCCURRENCES = 6
+# How far ahead to look for two consecutive days that both match a cron
+# expression's day fields: 28 years is a full cycle of weekdays and leap days.
+CRON_DAY_SCAN = timedelta(days=28 * 366)
 NAME_MAX = 80
 PROMPT_MAX = 8000
 SUMMARY_MAX = 500
@@ -183,14 +186,58 @@ def _normalize_cron(raw: Any, zone: ZoneInfo, settings: Any, now: datetime) -> s
     except (CroniterBadCronError, CroniterError, ValueError) as exc:
         raise ScheduleError(f"'{expr}' is not a valid cron expression ({exc}).") from None
     floor = timedelta(minutes=int(settings.min_job_interval_minutes))
-    for earlier, later in zip(times, times[1:]):
-        if later - earlier < floor:
-            raise ScheduleError(
-                f"The cron expression '{expr}' runs more often than every "
-                f"{_plural_minutes(int(settings.min_job_interval_minutes))}, which is the "
-                "shortest gap this platform allows."
-            )
+    # The sample catches gaps that depend on real time near `now` (a DST change
+    # this week); the wall-clock check covers every day, because six samples
+    # miss an expression that is sparse first and dense later in the day.
+    sampled_too_close = any(later - earlier < floor for earlier, later in zip(times, times[1:]))
+    if sampled_too_close or _cron_runs_closer_than(expr, floor, now.astimezone(zone)):
+        raise ScheduleError(
+            f"The cron expression '{expr}' runs more often than every "
+            f"{_plural_minutes(int(settings.min_job_interval_minutes))}, which is the "
+            "shortest gap this platform allows."
+        )
     return expr
+
+
+def _cron_field_values(field: list, full: range) -> list[int]:
+    return list(full) if field == ["*"] else sorted({int(v) for v in field})
+
+
+def _cron_runs_closer_than(expr: str, floor: timedelta, local_now: datetime) -> bool:
+    """Whether two runs of a valid cron expression are ever under `floor` apart
+    on the wall clock.
+
+    The minute and hour fields give the same times on every day that matches,
+    so the only gaps are between those times within a day and from a day's
+    last time to the next day's first time, if two consecutive days match.
+    """
+    fields = croniter(expr).expanded
+    minutes = _cron_field_values(fields[0], range(60))
+    hours = _cron_field_values(fields[1], range(24))
+    day_times = sorted(h * 60 + m for h in hours for m in minutes)
+    if any(timedelta(minutes=b - a) < floor for a, b in zip(day_times, day_times[1:])):
+        return True
+    overnight = timedelta(minutes=day_times[0] + 24 * 60 - day_times[-1])
+    # Scanning the calendar is the slow part, so only do it when it matters.
+    return overnight < floor and _consecutive_days_match(expr, day_times, local_now)
+
+
+def _consecutive_days_match(expr: str, day_times: list[int], local_now: datetime) -> bool:
+    """Whether some day's last run is followed by a run on the next day."""
+    last_h, last_m = divmod(day_times[-1], 60)
+    first_h, first_m = divmod(day_times[0], 60)
+    day_fields = " ".join(expr.split()[2:])
+    # Naive datetimes: this is calendar arithmetic, independent of the zone.
+    start = local_now.replace(tzinfo=None, hour=0, minute=0, second=0, microsecond=0)
+    it = croniter(f"{last_m} {last_h} {day_fields}", start)
+    try:
+        while (day := it.get_next(datetime)) < start + CRON_DAY_SCAN:
+            next_day = (day + timedelta(days=1)).replace(hour=first_h, minute=first_m)
+            if croniter.match(expr, next_day):
+                return True
+    except (CroniterBadDateError, CroniterError):
+        pass  # no further matching day
+    return False
 
 
 def normalize_schedule(
@@ -232,8 +279,18 @@ def compute_next_run(kind: str, value: str, tz: str, *, after: datetime) -> date
     if kind == "cron":
         # Cron is evaluated on the wall clock of the job's timezone, so
         # "0 9 * * *" stays at 09:00 local across a DST change.
-        local_after = after.astimezone(ZoneInfo(tz))
-        return croniter(value, local_after).get_next(datetime).astimezone(timezone.utc)
+        zone = ZoneInfo(tz)
+        it = croniter(value, after.astimezone(zone))
+        # When clocks fall back, croniter returns a wall time in the repeated
+        # hour twice. Like classic cron, a fixed-time job ('30 1 * * *') runs
+        # only the first time; a job with '*' in its minute or hour field
+        # ('*/30 * * * *') keeps running through the repeated hour.
+        minute, hour = value.split()[:2]
+        fixed_time = not (minute.startswith("*") or hour.startswith("*"))
+        while True:
+            nxt = it.get_next(datetime).astimezone(timezone.utc)
+            if not (fixed_time and nxt.astimezone(zone).fold == 1):
+                return nxt
     raise ValueError(f"unknown schedule kind {kind!r}")
 
 
@@ -692,6 +749,15 @@ class Scheduler:
             run = db.one("SELECT * FROM job_runs WHERE id = ?", (run_id,))
             if run is None or run["status"] != "queued":
                 return None
+            if self._stopping:
+                # Shutdown frees slots as it stops the running runs; a queued
+                # run that takes one must not start a runner nobody will stop.
+                db.execute(
+                    "UPDATE job_runs SET status = 'interrupted', error_message = ?, finished_at = ? "
+                    "WHERE id = ?",
+                    (SHUTDOWN_BEFORE_START, now, run_id),
+                )
+                return None
             job = db.one(
                 "SELECT * FROM jobs WHERE id = ? AND agent_id = ?", (run["job_id"], run["agent_id"])
             )
@@ -882,8 +948,13 @@ class Scheduler:
 
     # -- cancelling and recovery ------------------------------------------------
 
-    async def cancel_job(self, job_id: str) -> None:
-        """Cancel a job: no more occurrences, queued run dropped, running run stopped."""
+    async def cancel_job(self, job_id: str, *, exclude_run_id: str | None = None) -> None:
+        """Cancel a job: no more occurrences, queued run dropped, running run stopped.
+
+        `exclude_run_id` is a run that cancelled its own job (the MCP tool). It
+        is left to finish: stopping it would kill the turn while it waits for
+        the tool's answer and lose whatever it meant to do after cancelling.
+        """
         db = self.ctx.db
         now = iso(utcnow())
         with db.transaction():
@@ -902,7 +973,8 @@ class Scheduler:
                 (CANCELLED_BEFORE_START, now, job_id),
             )
             running = db.all(
-                "SELECT id FROM job_runs WHERE job_id = ? AND status = 'running'", (job_id,)
+                "SELECT id FROM job_runs WHERE job_id = ? AND status = 'running' AND id IS NOT ?",
+                (job_id, exclude_run_id),
             )
         logger.info("job %s cancelled (%d running run(s) to stop)", job_id, len(running))
         for row in running:

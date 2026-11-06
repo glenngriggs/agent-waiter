@@ -7,7 +7,9 @@ picks the credentials here:
 - "platform": the operator's own upstream key from the environment (the key
   in `.env`). Only accounts listed in DEN_PLATFORM_KEY_USERS may use it, and
   the list is empty by default, so a public server never spends the
-  operator's key on strangers.
+  operator's key on strangers. A listed email counts only for an account
+  created before the server started (Settings.platform_allowed), because
+  sign-up does not verify addresses.
 - "openai", "anthropic", "umgpt", "custom": the signed-in user's own key,
   added on the Settings page. Keys are encrypted at rest with a key derived
   from the server secret, are never sent back to the browser (only the last
@@ -193,6 +195,10 @@ def models_for(ctx: Any, user_id: str, provider_id: str) -> list[ModelInfo]:
         # Same names and notes as the catalog where a model is listed there.
         catalog = {m.id: m for p in CATALOG.values() for m in p.models}
         return [catalog.get(m) or ModelInfo(m, settings.label_for(m)) for m in settings.models]
+    if settings.model_auth == "chatgpt":
+        # Only the shared provider exists in chatgpt mode (user_providers);
+        # keys saved earlier in proxy mode must not unlock models here.
+        return []
     provider = CATALOG.get(provider_id)
     if provider is None or (provider.custom_url and not settings.allow_custom_provider):
         return []
@@ -218,8 +224,32 @@ def user_email(ctx: Any, user_id: str) -> str:
     return row["email"] if row else ""
 
 
+# Users already warned about (listed, but signed up after the server started),
+# so the log gets one line per user instead of one per request.
+_warned_new_listed: set[str] = set()
+
+
 def platform_available(ctx: Any, user_id: str) -> bool:
-    return ctx.settings.platform_allowed(user_email(ctx, user_id))
+    settings = ctx.settings
+    row = ctx.db.one("SELECT email, created_at FROM users WHERE id = ?", (user_id,))
+    if row is None:
+        return False
+    if settings.platform_allowed(row["email"], row["created_at"]):
+        return True
+    if (
+        settings.platform_listed(row["email"])
+        and not settings.account_predates_start(row["created_at"])
+        and user_id not in _warned_new_listed
+    ):
+        # Only the operator reads this log, and they are the one who can act.
+        _warned_new_listed.add(user_id)
+        logger.warning(
+            "account %s (%s) is listed in DEN_PLATFORM_KEY_USERS but signed up after the "
+            "server started, so it may not use the shared key yet. If that account is "
+            "really theirs, restart the server.",
+            user_id, row["email"],
+        )
+    return False
 
 
 # --------------------------------------------------------------------------
@@ -278,6 +308,10 @@ def resolve_credentials(ctx: Any, user_id: str, provider_id: str) -> Credentials
                 "platform",
             )
         return None
+    if settings.model_auth == "chatgpt":
+        # Codex runs on the mounted login whenever the config has no proxy
+        # provider, so a leftover own key would hand that login to anyone.
+        return None
     provider = CATALOG.get(provider_id)
     if provider is None:
         return None
@@ -292,6 +326,20 @@ def resolve_credentials(ctx: Any, user_id: str, provider_id: str) -> Credentials
 
 
 def no_key_message(settings: Settings, provider_id: str) -> str:
+    if settings.model_auth == "chatgpt":
+        # There are no keys to add in this mode, so do not point to Settings.
+        if provider_id == PLATFORM:
+            return (
+                "This server runs agents on the operator's ChatGPT login, which your account "
+                "may not use. The operator lists the accounts allowed to use it in "
+                "DEN_PLATFORM_KEY_USERS; an account counts once the server has been "
+                "restarted after it signed up."
+            )
+        return (
+            f"This server runs agents only on the operator's ChatGPT login, so agents on "
+            f"{provider_label(settings, provider_id)} cannot run here. Switch this agent to "
+            "one of the server's models."
+        )
     if provider_id == PLATFORM:
         return (
             "This agent uses the server's shared key, which your account may not use. "
@@ -339,9 +387,20 @@ async def check_base_url(url: str, allow_private: bool) -> str:
         return url
     if parts.scheme != "https":
         raise ProviderInputError("The URL must use https.")
+    # Resolve the host exactly as httpx will send it. getaddrinfo on the raw
+    # name applies IDNA 2003 while httpx uses IDNA 2008, so a name such as
+    # "evil\u00df.example" would be checked as one DNS name and connected to
+    # as another.
+    try:
+        parsed = httpx.URL(url)
+        host = parsed.raw_host.decode("ascii")
+    except (httpx.InvalidURL, UnicodeError):
+        raise ProviderInputError("That server name is not valid.") from None
+    if not host:
+        raise ProviderInputError("Enter a full URL such as https://example.com/v1.")
     try:
         infos = await asyncio.get_running_loop().getaddrinfo(
-            parts.hostname, parts.port or 443, type=socket.SOCK_STREAM
+            host, parsed.port or 443, type=socket.SOCK_STREAM
         )
     except OSError:
         raise ProviderInputError(f"Could not find the server {parts.hostname}.") from None

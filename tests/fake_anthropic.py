@@ -9,19 +9,27 @@ tests/fake_model.py it answers from the last real user text:
                       "Scheduled it."
 - ``WEB``             (with the web_search server tool offered) a
                       ``server_tool_use`` + ``web_search_tool_result``, then text
+- ``DECLINE:<cmd>``   a mid-output refusal fallback: the declined model's
+                      thinking and ``tool_use`` of ``exec_command``, a
+                      ``fallback`` block, then the fallback model's text
+- ``EMPTY:<cmd>``     an empty text block, then a ``tool_use`` of ``exec_command``
+- ``TOOLONG``         a 400 "prompt is too long" (before any other check)
 - the probe prompt    "ready"
 - anything else       "Echo: <first 200 chars>"
 
 It is strict where the real API is, so translation bugs fail loudly with a
 400: the first message must be from the user and the last must not be from
 the assistant, every ``tool_use`` must be answered first thing in the next
-user message, text blocks may not be empty, and tool names must match the
-API's pattern. It also checks exact replay: every assistant message that
+user message, text blocks may not be empty, tool names must match the
+API's pattern, a top-level ``cache_control`` must be well formed, and the
+thinking and tool calls before a turn's last ``fallback`` block must be left
+out when the turn is sent back. It also checks exact replay: every assistant message that
 carries a thinking block it produced must come back byte-for-byte as it was
-sent (that is what keeps real thinking blocks valid).
+sent (that is what keeps real thinking blocks valid). Cache reads are only
+reported when the request asks for caching.
 
 ``reject_extras`` makes it refuse requests that use the optional betas, to
-test the bridge's plain-mode retry.
+test the bridge's plain-mode retry; ``reject_message`` is the 400's text.
 """
 
 from __future__ import annotations
@@ -44,6 +52,10 @@ VALID_KEY = "sk-ant-test-0123456789"
 TOOL_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _RUN = re.compile(r"RUN:(.+)", re.DOTALL)
 _SCHEDULE = re.compile(r"SCHEDULE:(\d+)")
+_DECLINE = re.compile(r"DECLINE:(.+)", re.DOTALL)
+_EMPTY = re.compile(r"EMPTY:(.+)", re.DOTALL)
+# Blocks the API wants left out when they come before a turn's last fallback.
+_PRE_FALLBACK_OMIT = ("thinking", "redacted_thinking", "tool_use")
 
 
 def _error(status: int, kind: str, message: str) -> JSONResponse:
@@ -68,6 +80,10 @@ def check_request(body: dict[str, Any], produced: dict[str, str]) -> str | None:
         return "messages: the first message must use the user role"
     if messages[-1].get("role") == "assistant":
         return "messages: this model does not support assistant message prefill"
+    cache = body.get("cache_control")
+    if cache is not None and (not isinstance(cache, dict) or cache.get("type") != "ephemeral"
+                              or set(cache) - {"type", "ttl"}):
+        return "cache_control: invalid automatic caching settings"
     for tool in body.get("tools") or []:
         if "input_schema" in tool and not TOOL_NAME.match(tool.get("name", "")):
             return f"tools: invalid tool name {tool.get('name')!r}"
@@ -92,6 +108,10 @@ def check_request(body: dict[str, Any], produced: dict[str, str]) -> str | None:
                     return f"messages.{i}: unexpected tool_use_id in tool_result"
             pending = set()
         else:
+            seam = max((j for j, b in enumerate(content) if b.get("type") == "fallback"), default=-1)
+            if any(b.get("type") in _PRE_FALLBACK_OMIT for b in content[:max(seam, 0)]):
+                return (f"messages.{i}: thinking and tool_use blocks before the final "
+                        "fallback block must be omitted")
             pending |= {b["id"] for b in content if b.get("type") == "tool_use"}
             signatures = [b.get("signature") for b in content if b.get("type") == "thinking"]
             for signature in signatures:
@@ -101,7 +121,18 @@ def check_request(body: dict[str, Any], produced: dict[str, str]) -> str | None:
     return None
 
 
-def build_fake_app(*, reject_extras: bool = False, delay: float = 0.0) -> FastAPI:
+def _last_user_text(messages: list[dict[str, Any]]) -> str:
+    for message in reversed(messages):
+        if message.get("role") != "user":
+            continue
+        texts = [t for t in _texts(message.get("content") or []) if not t.strip().startswith("<")]
+        if texts:
+            return texts[-1]
+    return ""
+
+
+def build_fake_app(*, reject_extras: bool = False, delay: float = 0.0,
+                   reject_message: str = "Unexpected beta or fallbacks field") -> FastAPI:
     app = FastAPI(title="Den fake Anthropic")
     app.state.requests = []
     app.state.produced = {}  # thinking signature -> the exact content it was sent in
@@ -129,9 +160,12 @@ def build_fake_app(*, reject_extras: bool = False, delay: float = 0.0) -> FastAP
             return _error(401, "authentication_error", "invalid x-api-key")
         if body.get("model") not in KNOWN_MODELS:
             return _error(404, "not_found_error", f"model: {body.get('model')}")
+        if "TOOLONG" in _last_user_text(body.get("messages") or []):
+            return _error(400, "invalid_request_error",
+                          "prompt is too long: 300000 tokens > 200000 maximum")
         betas = request.headers.get("anthropic-beta", "")
         if reject_extras and (betas or "fallbacks" in body):
-            return _error(400, "invalid_request_error", "Unexpected beta or fallbacks field")
+            return _error(400, "invalid_request_error", reject_message)
         if not body.get("stream"):
             return _error(400, "invalid_request_error", "the fake only streams")
         problem = check_request(body, app.state.produced)
@@ -144,20 +178,33 @@ def build_fake_app(*, reject_extras: bool = False, delay: float = 0.0) -> FastAP
         last = messages[-1]
         has_result = any(b.get("type") == "tool_result" for b in last["content"]) \
             if isinstance(last["content"], list) else False
-        user_text = ""
-        for message in reversed(messages):
-            if message["role"] != "user":
-                continue
-            texts = [t for t in _texts(message["content"]) if not t.strip().startswith("<")]
-            if texts:
-                user_text = texts[-1]
-                break
+        user_text = _last_user_text(messages)
         tool_names = {t.get("name") for t in body.get("tools") or []}
 
         blocks: list[dict[str, Any]] = []
         stop = "end_turn"
         run, schedule = _RUN.search(user_text), _SCHEDULE.search(user_text)
-        if run and not has_result:
+        decline, empty = _DECLINE.search(user_text), _EMPTY.search(user_text)
+        if decline:
+            blocks = [
+                {"type": "thinking", "thinking": "I should run it.", "signature": f"sigdecl{n}"},
+                {"type": "tool_use", "id": f"toolu_declined_{n}", "name": "exec_command",
+                 "input": {"cmd": decline.group(1).strip()}},
+                {"type": "fallback", "from": {"model": body["model"]},
+                 "to": {"model": "claude-opus-4-8"},
+                 "trigger": {"type": "refusal", "category": "cyber"}},
+                {"type": "text", "text": "Here is a safer approach."},
+            ]
+        elif empty and not has_result:
+            blocks = [
+                {"type": "text", "text": ""},
+                {"type": "tool_use", "id": f"toolu_{n}", "name": "exec_command",
+                 "input": {"cmd": empty.group(1).strip()}},
+            ]
+            stop = "tool_use"
+        elif empty:
+            blocks = [{"type": "text", "text": "Ran it."}]
+        elif run and not has_result:
             blocks = [
                 {"type": "thinking", "thinking": "I should run the command.", "signature": f"sig{n}"},
                 {"type": "text", "text": "Running it."},
@@ -186,7 +233,9 @@ def build_fake_app(*, reject_extras: bool = False, delay: float = 0.0) -> FastAP
         else:
             blocks = [{"type": "thinking", "thinking": "Echo it.", "signature": f"sig{n}"},
                       {"type": "text", "text": "Echo: " + user_text[:200]}]
-        for block in blocks:
+        # A declined partial's thinking is not replayed as sent, so it is not
+        # held to exact replay (the fallback rule above covers it instead).
+        for block in blocks if not decline else []:
             if block["type"] == "thinking":
                 app.state.produced[block["signature"]] = json.dumps(blocks, sort_keys=True)
 
@@ -194,7 +243,8 @@ def build_fake_app(*, reject_extras: bool = False, delay: float = 0.0) -> FastAP
             yield _sse("message_start", {"message": {
                 "id": f"msg_{n}", "type": "message", "role": "assistant", "model": body["model"],
                 "content": [], "stop_reason": None, "stop_sequence": None,
-                "usage": {"input_tokens": 100, "output_tokens": 1, "cache_read_input_tokens": 40,
+                "usage": {"input_tokens": 100, "output_tokens": 1,
+                          "cache_read_input_tokens": 40 if "cache_control" in body else 0,
                           "cache_creation_input_tokens": 0}}})
             for index, block in enumerate(blocks):
                 if delay:

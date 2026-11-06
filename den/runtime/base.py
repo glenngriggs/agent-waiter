@@ -22,6 +22,10 @@ class AgentRuntimeError(Exception):
         self.detail = detail
 
 
+# Raised when a launch is asked for an agent whose row is gone.
+AGENT_DELETED_MESSAGE = "The agent was deleted."
+
+
 class AgentRuntime(ABC):
     name: str = "abstract"
 

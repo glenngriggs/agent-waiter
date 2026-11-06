@@ -185,6 +185,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return JSONResponse({"detail": _validation_message(exc)}, status_code=400)
         return await request_validation_exception_handler(request, exc)
 
+    @app.exception_handler(UnicodeEncodeError)
+    async def unencodable_text(request: Request, exc: UnicodeEncodeError) -> JSONResponse:
+        # JSON may carry lone surrogates ("\ud800") that Python accepts but
+        # SQLite and hashing cannot encode. On any route that stores request
+        # text (agent names, prompts, keys) that is bad input, not a 500.
+        logger.info("request to %s had text that cannot be encoded: %s", request.url.path, exc)
+        return JSONResponse({"detail": "The request contains invalid text."}, status_code=400)
+
     for module in (auth, account, agents, chat, files, jobs, mcp_server, model_proxy):
         app.include_router(module.router)
 

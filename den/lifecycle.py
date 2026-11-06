@@ -11,10 +11,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
 from datetime import timedelta
+from pathlib import Path
 from typing import Any
 
-from .agent_files import agent_paths, init_agent_dirs, remove_agent_dirs, write_codex_config
+from .agent_files import (
+    SCRATCH_DIR, agent_paths, init_agent_dirs, remove_agent_dirs, write_codex_config,
+)
 from . import providers
 from .codex_bridge import run_probe
 from .db import iso, utcnow
@@ -153,22 +157,26 @@ async def reap_idle_agents(ctx: Any) -> int:
         return 0  # the local runtime has no containers to stop
     minutes = int(ctx.settings.idle_stop_minutes)
     cutoff = iso(utcnow() - timedelta(minutes=minutes))
+    # 'error' too: a failed probe leaves the container that setup started
+    # running, and nothing else would ever stop it. 'creating' is skipped so
+    # a container is never stopped under a running setup.
     candidates = ctx.db.all(
-        "SELECT id FROM agents WHERE setup_state = 'ready' AND last_active_at < ?", (cutoff,)
+        "SELECT id FROM agents WHERE setup_state IN ('ready', 'error') AND last_active_at < ?",
+        (cutoff,),
     )
     stopped = 0
     for row in candidates:
         agent_id = row["id"]
         try:
-            if ctx.turns.active_for_agent(agent_id):
+            if not _reapable(ctx, agent_id):
                 continue
             if await ctx.runtime.status(agent_id) != "running":
                 continue
-            # Re-check after the await: a message or job may have started while
-            # we asked Docker. With no await between this check and stop()
-            # taking the runtime's per-agent lock, a turn starting now waits
-            # for the stop and then starts the container again.
-            if ctx.turns.active_for_agent(agent_id):
+            # Re-check after the await: a message, job or setup retry may have
+            # started while we asked Docker. With no await between this check
+            # and stop() taking the runtime's per-agent lock, one starting now
+            # waits for the stop and then starts the container again.
+            if not _reapable(ctx, agent_id):
                 continue
             await ctx.runtime.stop(agent_id)
             stopped += 1
@@ -186,8 +194,59 @@ async def reap_idle_agents(ctx: Any) -> int:
     return stopped
 
 
+def _reapable(ctx: Any, agent_id: str) -> bool:
+    if ctx.turns.active_for_agent(agent_id) or agent_id in _setup_tasks:
+        return False
+    agent = ctx.get_agent(agent_id)
+    return agent is not None and agent["setup_state"] in ("ready", "error")
+
+
+def _stale_scratch_homes(ctx: Any) -> list[Path]:
+    """Scratch CODEX_HOMEs that no running job run or probe owns.
+
+    Only TurnRunner removes a scratch home, so a crash (or a stop that never
+    finished) leaves it behind. Each is named after its turn id; one whose
+    turn is no longer `running` (startup recovery marks a crashed one
+    interrupted) and has no live runner is stale. Synchronous, so no runner
+    can register in between; a new run always gets a new turn id.
+    """
+    agents_dir = ctx.settings.data_dir / "agents"
+    if not agents_dir.is_dir():
+        return []
+    registry = ctx.turns
+    live = {r.turn_id for r in [*registry.chat.values(), *registry.runs.values(),
+                                *registry.probes.values()]}
+    stale = []
+    for scratch in agents_dir.glob(f"*/codex-home/{SCRATCH_DIR}/*"):
+        turn_id = scratch.name
+        if turn_id in live or not scratch.is_dir() or scratch.is_symlink():
+            continue
+        row = ctx.db.one("SELECT status FROM turns WHERE id = ?", (turn_id,))
+        if row is None or row["status"] != "running":
+            stale.append(scratch)
+    return stale
+
+
+async def remove_stale_scratch_homes(ctx: Any) -> int:
+    """Delete scratch homes left behind by runs that ended without cleanup."""
+    stale = _stale_scratch_homes(ctx)
+    for scratch in stale:
+        await asyncio.to_thread(shutil.rmtree, scratch, True)
+    if stale:
+        logger.info("removed %d leftover scratch Codex home(s)", len(stale))
+    return len(stale)
+
+
 async def idle_reaper(ctx: Any) -> None:
-    """Every IDLE_CHECK_SECONDS, stop containers idle for idle_stop_minutes."""
+    """Every IDLE_CHECK_SECONDS, stop containers idle for idle_stop_minutes.
+
+    It starts with each app, so it first clears the scratch homes the last
+    process left behind (startup recovery has marked their turns by now).
+    """
+    try:
+        await remove_stale_scratch_homes(ctx)
+    except Exception:
+        logger.exception("removing leftover scratch homes failed")
     while True:
         await asyncio.sleep(IDLE_CHECK_SECONDS)
         try:
@@ -196,12 +255,22 @@ async def idle_reaper(ctx: Any) -> None:
             logger.exception("idle reaper pass failed")
 
 
-async def _wait_until_idle(ctx: Any, agent_id: str, timeout: float) -> bool:
+async def _stop_until_idle(ctx: Any, agent_id: str, timeout: float) -> bool:
+    """Wait for the agent's turns to end, stopping any that started meanwhile.
+
+    The closing mark keeps chat out, but a job run that was already waiting
+    for a slot can still start; waiting alone would let it run on.
+    """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
-    while ctx.turns.active_for_agent(agent_id):
+    while active := ctx.turns.active_for_agent(agent_id):
         if loop.time() >= deadline:
             return False
+        live = [r for r in active if not r.stop_requested]
+        if live:
+            stopping = asyncio.gather(*(r.stop("user") for r in live), return_exceptions=True)
+            await asyncio.wait({stopping}, timeout=max(deadline - loop.time(), 0.1))
+            continue
         await asyncio.sleep(0.1)
     return True
 
@@ -210,7 +279,15 @@ async def delete_agent(ctx: Any, agent: dict) -> None:
     """Delete an agent completely: setup, turns, jobs, container, rows, files."""
     agent_id = agent["id"]
     logger.info("deleting agent %s", agent_id)
+    # Refuse new chat messages until the row is gone: one accepted while the
+    # turns below stop (or while the container is removed) would start a turn
+    # that outlives the agent and, on Docker, brings its container back.
+    with ctx.turns.closing(agent_id):
+        await _delete_agent_closing(ctx, agent_id)
+    logger.info("agent %s deleted", agent_id)
 
+
+async def _delete_agent_closing(ctx: Any, agent_id: str) -> None:
     # 1. Stop onboarding first, or it could create a container after we remove it.
     setup = _setup_tasks.get(agent_id)
     if setup is not None and not setup.done():
@@ -234,7 +311,7 @@ async def delete_agent(ctx: Any, agent: dict) -> None:
     from .codex_bridge import cancel_queue  # local import: codex_bridge imports this module's peers
     cancel_queue(ctx, agent_id, "Cancelled: the agent is being deleted.")
     await ctx.turns.stop_agent(agent_id)
-    if not await _wait_until_idle(ctx, agent_id, DELETE_DRAIN_SECONDS):
+    if not await _stop_until_idle(ctx, agent_id, DELETE_DRAIN_SECONDS):
         logger.warning("agent %s still had active turns after %.0f s; deleting anyway",
                        agent_id, DELETE_DRAIN_SECONDS)
 
@@ -250,7 +327,6 @@ async def delete_agent(ctx: Any, agent: dict) -> None:
     # 5. Rows (turns, jobs, runs and events cascade), then the files.
     ctx.db.execute("DELETE FROM agents WHERE id = ?", (agent_id,))
     await asyncio.to_thread(remove_agent_dirs, agent_paths(ctx.settings, agent_id))
-    logger.info("agent %s deleted", agent_id)
 
 
 async def agent_out(ctx: Any, agent_row: dict) -> dict:

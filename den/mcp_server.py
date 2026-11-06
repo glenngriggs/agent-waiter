@@ -344,7 +344,7 @@ def _list_jobs(ctx: AppContext, agent: dict) -> str:
     return json.dumps({"jobs": jobs}, indent=2)
 
 
-async def _cancel_job(ctx: AppContext, agent: dict, args: dict[str, Any]) -> str:
+async def _cancel_job(ctx: AppContext, agent: dict, args: dict[str, Any], meta: Any) -> str:
     job_id = _require_str(args, "job_id").strip()
     # Scoped to this agent, so another agent's job id looks like no job at all.
     job = ctx.db.one("SELECT * FROM jobs WHERE id = ? AND agent_id = ?", (job_id, agent["id"]))
@@ -357,7 +357,16 @@ async def _cancel_job(ctx: AppContext, agent: dict, args: dict[str, Any]) -> str
     if ctx.scheduler is None:
         logger.error("cancel_job called before the scheduler was set on the context")
         raise ToolFailure("The platform's scheduler is not running; try again shortly.")
-    await ctx.scheduler.cancel_job(job_id)
+    # A run may cancel its own job ("check until it passes, then stop"); that
+    # run must finish, or the agent never sees this answer.
+    caller_run_id = None
+    caller_turn = _source_turn_id(ctx, agent, meta)
+    if caller_turn is not None:
+        row = ctx.db.one(
+            "SELECT job_run_id FROM turns WHERE id = ? AND agent_id = ?", (caller_turn, agent["id"])
+        )
+        caller_run_id = (row or {}).get("job_run_id")
+    await ctx.scheduler.cancel_job(job_id, exclude_run_id=caller_run_id)
     logger.info("agent %s cancelled its job %s", agent["id"], job_id)
     return f"Cancelled job {job_id}."
 
@@ -372,7 +381,7 @@ async def _call_tool(
         elif name == "list_jobs":
             text = _list_jobs(ctx, agent)
         else:
-            text = await _cancel_job(ctx, agent, args)
+            text = await _cancel_job(ctx, agent, args, meta)
     except (ToolFailure, sched.ScheduleError) as exc:
         logger.info("tool %s for agent %s refused: %s", name, agent["id"], exc)
         return _tool_result(str(exc), is_error=True)

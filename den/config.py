@@ -6,10 +6,15 @@ Settings object with `dataclasses.replace` instead of patching modules.
 
 from __future__ import annotations
 
+import logging
 import os
+import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping
+
+logger = logging.getLogger("den.config")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -71,6 +76,10 @@ class Settings:
     # "*" for everyone. Empty by default, so a public deployment never shares
     # the operator's key unless the operator says so.
     platform_key_users: tuple[str, ...] = ()
+    # When these settings were loaded, i.e. when the server started. A listed
+    # email only counts for an account created before then (see
+    # platform_allowed).
+    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     platform_label: str = "Server key"
     # Base URL overrides for the providers users bring keys for (tests point
     # these at fakes; operators can point them at a gateway).
@@ -86,12 +95,38 @@ class Settings:
     def label_for(self, model_id: str) -> str:
         return self.model_labels.get(model_id, model_id)
 
-    def platform_allowed(self, email: str) -> bool:
-        """True when this account may use the operator's own key."""
+    def platform_allowed(self, email: str, created_at: str | None = None) -> bool:
+        """True when this account may use the operator's own key.
+
+        Sign-up does not verify email addresses, so a listed address alone
+        would go to whoever registers it first, including after its owner
+        deletes the account. A listed email therefore only counts for an
+        account that already existed when the server started: changing the
+        list needs a restart anyway, and restarting after the listed people
+        have signed up pins the list to their accounts. `created_at` is the
+        account's ISO creation time; without it an email entry never matches.
+        """
         if self.model_auth != "chatgpt" and not self.upstream_api_key:
             return False
         allowed = {e.strip().lower() for e in self.platform_key_users}
-        return "*" in allowed or email.strip().lower() in allowed
+        if "*" in allowed:
+            return True
+        return email.strip().lower() in allowed and self.account_predates_start(created_at)
+
+    def platform_listed(self, email: str) -> bool:
+        """True when this email is on DEN_PLATFORM_KEY_USERS by name (not via "*")."""
+        return email.strip().lower() in {e.strip().lower() for e in self.platform_key_users}
+
+    def account_predates_start(self, created_at: str | None) -> bool:
+        if not created_at:
+            return False
+        try:
+            created = datetime.fromisoformat(created_at)
+        except ValueError:
+            return False
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        return created < self.started_at
 
     @property
     def container_dir(self) -> Path:
@@ -139,6 +174,14 @@ def load_settings(env: Mapping[str, str] = os.environ) -> Settings:
     platform_users = tuple(
         e.strip().lower() for e in env.get("DEN_PLATFORM_KEY_USERS", "").split(",") if e.strip()
     )
+    if model_auth == "chatgpt" and not platform_users:
+        # In chatgpt mode the list is the only way to use the mounted login,
+        # and no keys can be added, so an empty list leaves nobody able to
+        # create an agent.
+        logger.warning(
+            "DEN_MODEL_AUTH=chatgpt but DEN_PLATFORM_KEY_USERS is empty: no account can "
+            "create agents. Sign up, add your email to DEN_PLATFORM_KEY_USERS and restart."
+        )
     provider_urls: dict[str, str] = {}
     extra_models: dict[str, tuple[str, ...]] = {}
     for provider in ("openai", "anthropic", "umgpt"):
@@ -186,10 +229,35 @@ def load_settings(env: Mapping[str, str] = os.environ) -> Settings:
     )
 
 
+# A comment after an unquoted value: "#" after whitespace (including the
+# whitespace right after "="). A "#" inside a value, as in `KEY=a#b`, stays.
+_INLINE_COMMENT = re.compile(r"\s#")
+
+
+def dotenv_value(raw: str) -> str:
+    """The value of one KEY=VALUE line, read the way python-dotenv reads it.
+
+    A quoted value is the text between its quotes, so it may hold "#". An
+    unquoted value ends at a "#" that follows whitespace, so a line such as
+    `KEY=value   # note` (as the README shows) does not put the note into the
+    key or the allow list.
+    """
+    value = raw.strip()
+    if value[:1] in ('"', "'"):
+        end = value.find(value[0], 1)
+        if end != -1:
+            return value[1:end]
+        return value[1:]
+    match = _INLINE_COMMENT.search(raw)
+    if match is not None:
+        raw = raw[: match.start()]
+    return raw.strip()
+
+
 def load_dotenv(path: Path) -> None:
     """Load simple KEY=VALUE lines into os.environ without overriding set vars.
 
-    Kept dependency-free on purpose; quotes around values are stripped.
+    Kept dependency-free on purpose; see dotenv_value for quotes and comments.
     """
     if not path.is_file():
         return
@@ -198,6 +266,6 @@ def load_dotenv(path: Path) -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        key, value = key.strip(), value.strip().strip('"').strip("'")
+        key, value = key.strip(), dotenv_value(value)
         if key and key not in os.environ:
             os.environ[key] = value

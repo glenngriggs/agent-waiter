@@ -22,7 +22,7 @@ from ..agent_files import agent_paths, init_agent_dirs, write_codex_config
 from ..config import Settings
 from ..db import Database
 from ..security import make_agent_token
-from .base import AgentRuntime
+from .base import AGENT_DELETED_MESSAGE, AgentRuntime, AgentRuntimeError
 
 logger = logging.getLogger("den.runtime.local")
 
@@ -41,11 +41,15 @@ class LocalRuntime(AgentRuntime):
 
         A caller may hold a row loaded before restart() bumped token_version;
         launching with that stale token would make every model and MCP call
-        fail with 401.
+        fail with 401. Raises if the agent was deleted, rather than
+        recreating the directory delete_agent is removing.
         """
         if self.db is None:
             return agent
-        return self.db.one("SELECT * FROM agents WHERE id = ?", (agent["id"],)) or agent
+        fresh = self.db.one("SELECT * FROM agents WHERE id = ?", (agent["id"],))
+        if fresh is None:
+            raise AgentRuntimeError(AGENT_DELETED_MESSAGE)
+        return fresh
 
     def _codex_bin(self) -> str:
         return self.settings.codex_bin or str(bundled_codex_path())
@@ -98,6 +102,8 @@ class LocalRuntime(AgentRuntime):
                 "UPDATE agents SET token_version = token_version + 1 WHERE id = ?",
                 (agent["id"],),
             )
+            if self.db.one("SELECT id FROM agents WHERE id = ?", (agent["id"],)) is None:
+                return  # deleted meanwhile; like DockerRuntime, recreate nothing
             self._prepare_files(self._fresh(agent))
 
     async def status(self, agent_id: str) -> str:

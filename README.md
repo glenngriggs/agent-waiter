@@ -50,11 +50,15 @@ Nothing in `.env` is required: users add their own keys in **Settings → API ke
 To also share one key of your own with chosen accounts (for example, just yourself), set it in `.env` together with who may use it:
 
 ```sh
-UMGPT_TOOLKIT_API_KEY=...                 # or OPENAI_API_KEY=...
-DEN_PLATFORM_KEY_USERS=you@example.com    # comma separated; * = everyone (private servers only)
+# Your key (or OPENAI_API_KEY=...)
+UMGPT_TOOLKIT_API_KEY=...
+# Who may use it: comma separated; * = everyone (private servers only)
+DEN_PLATFORM_KEY_USERS=you@example.com
 ```
 
-Accounts not on that list never touch your key: they see only the providers they added keys for.
+Keep comments on their own lines in `.env`: text after a value can end up as part of it.
+
+Accounts not on that list never touch your key: they see only the providers they added keys for. Sign-up does not verify emails, so a listed email only counts for an account that existed when the server started: sign up first (each listed person with their own account), then restart Den.
 
 ## Run
 
@@ -105,9 +109,9 @@ DEN_UPSTREAM_BASE_URL=http://127.0.0.1:9100/v1 DEN_UPSTREAM_API_KEY=fake DEN_PLA
 
 ## Keeping keys out of git (and publishing)
 
-- `.env`, `secret.key`, databases and agent data are git-ignored. Keys live only in `.env` and in the encrypted database.
-- `python scripts/check_secrets.py --history` checks every tracked file and every commit on every branch. It looks for the exact values in your local `.env` and for anything shaped like an OpenAI or Anthropic key, and it never prints a secret. Run it before pushing to a new or public repository. CI runs it on every push.
-- `sh scripts/install-git-hooks.sh` installs a pre-commit hook that runs the quick check before each commit.
+- `.env`, `secret.key`, databases and agent data are git-ignored. Keys live only in `.env` and in the encrypted database. The scan fails if any of them is tracked anyway (for example after `git add -f`).
+- `python scripts/check_secrets.py --history` checks every tracked file and every commit on every branch, including merge commits and binary files. It looks for the values of the key variables in your local `.env` (names ending in `KEY`, `TOKEN`, `SECRET` or `PASSWORD`), for anything shaped like an OpenAI or Anthropic key, and for key variables assigned a real-looking value, and it never prints a secret. Run it before pushing to a new or public repository. CI runs it on every push.
+- `sh scripts/install-git-hooks.sh` installs a pre-commit hook that runs `check_secrets.py --staged` before each commit. That checks the staged content, which is what gets committed, even when the files on disk differ. If you installed the hook before `--staged` existed, run the installer again.
 - To publish, push the code without `.env`, then add your keys in Settings or a fresh `.env` on the server. Behind HTTPS, set `DEN_SECURE_COOKIES=true`, which also turns on HSTS.
 
 ## Tests

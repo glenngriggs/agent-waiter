@@ -207,6 +207,16 @@ async def model_proxy(
     if ctx.http is None:
         logger.error("model proxy called before the HTTP client was created")
         return _error(502, "The platform's model proxy is not ready yet.")
+    provider = providers.CATALOG.get(provider_id)
+    if provider is not None and provider.custom_url:
+        # A user-supplied name was checked when the key was saved, but its
+        # DNS may have been pointed at a private address since. Re-checking
+        # here narrows that to the gap between this lookup and the connect.
+        try:
+            await providers.check_base_url(creds.base_url, settings.allow_private_provider_urls)
+        except providers.ProviderInputError as exc:
+            logger.warning("custom base URL for agent %s refused: %s", agent["id"], exc)
+            return _error(403, f"The server URL saved for this key is no longer allowed: {exc}")
 
     model_name = payload.get("model") if isinstance(payload, dict) else None
 

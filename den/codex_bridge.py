@@ -20,10 +20,10 @@ import inspect
 import json
 import logging
 import sqlite3
-from contextlib import aclosing
+from contextlib import aclosing, contextmanager
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 from openai_codex import (
     ApprovalMode,
@@ -504,6 +504,12 @@ class TurnRunner:
         provider_id = agent.get("provider") or providers.PLATFORM
         if providers.resolve_credentials(ctx, agent["user_id"], provider_id) is None:
             return ("failed", "no_api_key", providers.no_key_message(ctx.settings, provider_id))
+        # The operator may have dropped the model from DEN_MODELS since the
+        # agent picked it; Codex would only fail later with a vague "try again".
+        if not providers.model_offered(ctx, agent["user_id"], provider_id, self._model):
+            return ("failed", "model_unavailable",
+                    f"The model {self._model} is no longer offered on this server. "
+                    "Switch this agent to another model.")
 
         await self._ensure_container(agent)
         self._check_stop()
@@ -513,8 +519,10 @@ class TurnRunner:
                 ctx.settings, agent_paths(ctx.settings, agent["id"]), agent["model"], self.turn_id
             )
         codex = AsyncCodex(ctx.runtime.codex_config(agent, self._scratch_subdir))
+        await self._start_client(codex)
+        # Published only once it is up: a stop() during start-up just sets
+        # stop_requested, and closing here (via _finish) is what ends it.
         self._codex = codex
-        await codex.__aenter__()  # launches app-server and runs `initialize`
         self._check_stop()
 
         thread = await self._open_thread(codex, agent, ctx.runtime.workspace_cwd(agent))
@@ -551,6 +559,27 @@ class TurnRunner:
         # tell a bad key from a provider outage; the user gets the mapped text.
         logger.warning("turn %s failed (status %s): %r", self.turn_id, status, error)
         return ("failed", *classify_turn_error(error, self._model))
+
+    @staticmethod
+    async def _start_client(codex: AsyncCodex) -> None:
+        """Launch app-server and run `initialize`, never leaking the process.
+
+        The SDK runs start() in a worker thread that cancellation cannot
+        stop, and its close() does nothing until start() has created the
+        process. So on cancellation, let start-up finish before closing.
+        (When start-up itself fails, the SDK has already closed the client.)
+        """
+        starting = asyncio.ensure_future(codex.__aenter__())
+        try:
+            await asyncio.shield(starting)
+        except asyncio.CancelledError:
+            try:
+                await asyncio.wait({starting}, timeout=STOP_WAIT_SECONDS)
+                if starting.done() and not starting.cancelled():
+                    starting.exception()  # retrieved, so asyncio does not log it
+            finally:
+                await codex.close()
+            raise
 
     async def _ensure_container(self, agent: dict) -> None:
         runtime = self.ctx.runtime
@@ -800,9 +829,34 @@ class TurnRegistry:
         self.probes: dict[str, TurnRunner] = {}  # turn id -> probe runner
         # False once shutdown begins, so finishing turns do not start queued ones.
         self.accepting = True
+        # Agents being deleted or having their container stopped/restarted,
+        # with how many such operations hold each (a stop can overlap a
+        # delete). While marked, no chat turn starts or queues, or it would
+        # outlive the operation that is stopping the agent's turns.
+        self._closing: dict[str, int] = {}
 
     def chat_busy(self, agent_id: str) -> bool:
         return agent_id in self.chat
+
+    def is_closing(self, agent_id: str) -> bool:
+        return agent_id in self._closing
+
+    @contextmanager
+    def closing(self, agent_id: str) -> Iterator[None]:
+        """Refuse new chat turns for the agent while the block runs.
+
+        Enter it before cancel_queue() and leave it once the operation is
+        done (for delete, once the agent row is gone).
+        """
+        self._closing[agent_id] = self._closing.get(agent_id, 0) + 1
+        try:
+            yield
+        finally:
+            left = self._closing[agent_id] - 1
+            if left:
+                self._closing[agent_id] = left
+            else:
+                del self._closing[agent_id]
 
     def active_for_agent(self, agent_id: str) -> list[TurnRunner]:
         """The agent's chat runner (if any) followed by its job-run runners."""
@@ -851,6 +905,19 @@ class QueueFull(Exception):
     """The agent already has MAX_QUEUED_MESSAGES waiting."""
 
 
+class AgentClosing(QueueFull):
+    """The agent is being deleted or its container stopped or restarted.
+
+    A QueueFull subclass so that routers which answer QueueFull with 409
+    refuse this the same way.
+    """
+
+
+AGENT_CLOSING_MESSAGE = (
+    "The agent is being stopped, restarted or deleted. Try again in a moment."
+)
+
+
 def queued_turns(ctx: "AppContext", agent_id: str) -> list[dict]:
     """The agent's waiting chat messages, next one first.
 
@@ -883,12 +950,15 @@ async def submit_chat_message(
     mode "queue" waits behind earlier messages. mode "interrupt" goes to the
     front of the queue and stops the turn that is running, so it starts as
     soon as that turn has ended. Returns {turn_id, queued, position}.
-    Raises QueueFull. No await happens between the busy check and starting
-    or queueing, so concurrent submissions keep their order.
+    Raises QueueFull, or AgentClosing while the agent is marked closing. No
+    await happens between the busy check and starting or queueing, so
+    concurrent submissions keep their order.
     """
     if mode not in ("queue", "interrupt"):
         raise ValueError(f"unknown mode {mode!r}")
     agent_id = agent["id"]
+    if ctx.turns.is_closing(agent_id):
+        raise AgentClosing(AGENT_CLOSING_MESSAGE)
     waiting = queued_turns(ctx, agent_id)
     if not ctx.turns.chat_busy(agent_id) and not waiting:
         turn_id = new_id()
@@ -947,7 +1017,8 @@ def dispatch_next(ctx: "AppContext", agent_id: str) -> str | None:
     Called when a chat turn ends and at startup. Synchronous on purpose: with
     no await inside, two callers can never both start a turn.
     """
-    if not ctx.turns.accepting or ctx.turns.chat_busy(agent_id):
+    if (not ctx.turns.accepting or ctx.turns.chat_busy(agent_id)
+            or ctx.turns.is_closing(agent_id)):
         return None
     agent = ctx.get_agent(agent_id)
     if agent is None or agent["setup_state"] != "ready":

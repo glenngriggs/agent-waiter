@@ -9,7 +9,7 @@ import os
 import re
 import secrets
 import time
-from collections import defaultdict, deque
+from collections import deque
 from pathlib import Path
 
 _SCRYPT_N, _SCRYPT_R, _SCRYPT_P = 2**14, 8, 1
@@ -96,25 +96,57 @@ def parse_agent_token(secret: bytes, token: str) -> tuple[str, int] | None:
 
 
 class LoginLimiter:
-    """Refuse logins for an email after too many recent failures (in memory)."""
+    """Refuse logins for an email after too many recent failures (in memory).
+
+    Login needs no account, so anyone can make this see any number of
+    distinct emails. Only emails with failures inside the window keep an
+    entry; everything else is dropped, so memory stays bounded by the
+    recent failure rate rather than by every email ever tried.
+    """
+
+    # fail() sweeps every key after this many calls, which catches emails
+    # that failed once and were never tried again (nothing else revisits them).
+    SWEEP_EVERY = 256
 
     def __init__(self, max_failures: int = 10, window_seconds: float = 600.0) -> None:
         self.max_failures = max_failures
         self.window = window_seconds
-        self._failures: dict[str, deque[float]] = defaultdict(deque)
+        self._failures: dict[str, deque[float]] = {}
+        self._fails_since_sweep = 0
 
-    def _trim(self, email: str) -> deque[float]:
-        q = self._failures[email.lower()]
+    def _recent(self, key: str) -> deque[float] | None:
+        """The failures for `key` still inside the window; None (and no entry) if none."""
+        q = self._failures.get(key)
+        if q is None:
+            return None
         cutoff = time.monotonic() - self.window
         while q and q[0] < cutoff:
             q.popleft()
+        if not q:
+            del self._failures[key]
+            return None
         return q
 
+    def _sweep(self) -> None:
+        cutoff = time.monotonic() - self.window
+        stale = [key for key, q in self._failures.items() if not q or q[-1] < cutoff]
+        for key in stale:
+            del self._failures[key]
+
     def check(self, email: str) -> bool:
-        return len(self._trim(email)) < self.max_failures
+        q = self._recent(email.lower())
+        return q is None or len(q) < self.max_failures
 
     def fail(self, email: str) -> None:
-        self._trim(email).append(time.monotonic())
+        key = email.lower()
+        q = self._recent(key)
+        if q is None:
+            q = self._failures[key] = deque()
+        q.append(time.monotonic())
+        self._fails_since_sweep += 1
+        if self._fails_since_sweep >= self.SWEEP_EVERY:
+            self._fails_since_sweep = 0
+            self._sweep()
 
     def reset(self, email: str) -> None:
         self._failures.pop(email.lower(), None)

@@ -127,6 +127,10 @@ async def create_agent(
     # Count and insert in one transaction so two parallel creates cannot both
     # slip under the per-user limit.
     with ctx.db.transaction() as db:
+        # delete-account may have removed the user since current_user ran;
+        # inserting then would fail the foreign key with a bare 500.
+        if db.one("SELECT 1 FROM users WHERE id = ?", (user["id"],)) is None:
+            raise HTTPException(401, "Not signed in.")
         count = db.one("SELECT COUNT(*) AS n FROM agents WHERE user_id = ?", (user["id"],))["n"]
         if count >= limit:
             raise HTTPException(409, f"You can have at most {limit} agents. Delete one first.")
@@ -213,7 +217,9 @@ async def container_action(
 ) -> dict:
     if action not in CONTAINER_ACTIONS:
         raise HTTPException(400, f"Unknown container action '{action}'. Use start, stop or restart.")
-    if agent["setup_state"] != "ready":
+    # Stopping is also allowed after a failed setup: the probe may have left
+    # the container running, and the user must be able to stop it.
+    if agent["setup_state"] != "ready" and not (action == "stop" and agent["setup_state"] == "error"):
         raise HTTPException(409, "The agent is not set up yet.")
     agent_id = agent["id"]
     try:
@@ -232,19 +238,23 @@ async def container_action(
             # restart the container) the moment the running turn ends. Then
             # stop every turn: closing their clients ends the Codex processes
             # cleanly and records the turns as interrupted.
-            codex_bridge.cancel_queue(ctx, agent_id, "Cancelled: the container was stopped.")
-            await ctx.turns.stop_agent(agent_id)
-            await ctx.runtime.stop(agent_id)
+            # The closing mark refuses new messages until the container is
+            # down; one accepted while the turns stop would start it again.
+            with ctx.turns.closing(agent_id):
+                codex_bridge.cancel_queue(ctx, agent_id, "Cancelled: the container was stopped.")
+                await ctx.turns.stop_agent(agent_id)
+                await ctx.runtime.stop(agent_id)
             _agent_status(
                 ctx, agent_id, "stopped",
                 "The container was stopped. It starts again by itself when needed.",
             )
         else:
             _agent_status(ctx, agent_id, "restarting", "Recreating the agent's container…")
-            codex_bridge.cancel_queue(ctx, agent_id, "Cancelled: the container was restarted.")
-            await ctx.turns.stop_agent(agent_id)
-            # restart() bumps token_version, revoking the old container's token.
-            await ctx.runtime.restart(agent)
+            with ctx.turns.closing(agent_id):
+                codex_bridge.cancel_queue(ctx, agent_id, "Cancelled: the container was restarted.")
+                await ctx.turns.stop_agent(agent_id)
+                # restart() bumps token_version, revoking the old container's token.
+                await ctx.runtime.restart(agent)
             _agent_status(ctx, agent_id, "running", "The container was recreated and is running.")
     except AgentRuntimeError as exc:
         logger.warning("container %s failed for agent %s: %s | %s",

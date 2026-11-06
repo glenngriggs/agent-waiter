@@ -38,6 +38,29 @@ def _agents_using(ctx: AppContext, user_id: str, provider_id: str) -> int:
     )["n"]
 
 
+def _stranded_agents(
+    ctx: AppContext, user_id: str, provider: providers.Provider, new_models: list[str]
+) -> list[dict]:
+    """This user's agents on a model that saving `new_models` would stop offering.
+
+    An agent whose model disappears still passes the key check, so its turns
+    would start Codex only to fail with a misleading "try again". Agents
+    already on a model that is not offered (the operator dropped it) do not
+    count, so they never block saving a key.
+    """
+    offered_now = {m.id for m in providers.models_for(ctx, user_id, provider.id)}
+    offered_after = (
+        {m.id for m in provider.models}
+        | set(ctx.settings.provider_extra_models.get(provider.id, ()))
+        | set(new_models)
+    )
+    rows = ctx.db.all(
+        "SELECT name, model FROM agents WHERE user_id = ? AND provider = ? ORDER BY created_at",
+        (user_id, provider.id),
+    )
+    return [r for r in rows if r["model"] in offered_now and r["model"] not in offered_after]
+
+
 def provider_out(ctx: AppContext, user: dict, provider_id: str) -> dict:
     user_id = user["id"]
     agents = _agents_using(ctx, user_id, provider_id)
@@ -122,7 +145,8 @@ async def save_key(
         "SELECT * FROM api_keys WHERE user_id = ? AND provider = ?", (user["id"], provider_id)
     )
     try:
-        if body.api_key is not None and body.api_key.strip():
+        typed_key = body.api_key is not None and bool(body.api_key.strip())
+        if typed_key:
             api_key = providers.check_api_key(body.api_key)
         elif existing is not None:
             api_key = providers.decrypt_key(ctx.secret, existing["key_ciphertext"]) or ""
@@ -136,6 +160,11 @@ async def save_key(
             if not raw_url:
                 raise providers.ProviderInputError("Enter the server's base URL.")
             base_url = await providers.check_base_url(raw_url, ctx.settings.allow_private_provider_urls)
+            # verify_key sends the key to this URL. A saved key may only go
+            # back to the server it was saved for, or anyone holding the
+            # session could point it at their own server and read it.
+            if not typed_key and base_url != (existing or {}).get("base_url"):
+                raise providers.ProviderInputError("Paste the key again to change the server URL.")
         else:
             base_url = providers.base_url_for(ctx.settings, provider_id, None)
 
@@ -147,6 +176,15 @@ async def save_key(
             raise providers.ProviderInputError("List at least one model id this server offers.")
     except providers.ProviderInputError as exc:
         raise HTTPException(400, str(exc)) from None
+
+    stranded = _stranded_agents(ctx, user["id"], provider, models)
+    if stranded:
+        names = ", ".join(f"'{r['name']}' ({r['model']})" for r in stranded)
+        raise HTTPException(
+            400,
+            f"These agents still run on a model you are removing: {names}. "
+            "Switch them to another model first, then save the key.",
+        )
 
     problem = await providers.verify_key(ctx, provider_id, api_key, base_url)
     if problem is not None:
@@ -173,10 +211,17 @@ async def save_key(
 async def test_key(
     provider_id: str, user: dict = Depends(current_user), ctx: AppContext = Depends(get_ctx)
 ) -> dict:
-    _user_provider(ctx, provider_id)
+    provider = _user_provider(ctx, provider_id)
     creds = providers.resolve_credentials(ctx, user["id"], provider_id)
     if creds is None:
         raise HTTPException(404, "There is no usable key for this provider.")
+    if provider.custom_url:
+        # The name may point somewhere else now than when the key was saved.
+        try:
+            await providers.check_base_url(creds.base_url, ctx.settings.allow_private_provider_urls)
+        except providers.ProviderInputError as exc:
+            return {"ok": False, "message": str(exc),
+                    "provider": provider_out(ctx, user, provider_id)}
     problem = await providers.verify_key(ctx, provider_id, creds.api_key, creds.base_url)
     if problem is None:
         ctx.db.execute(

@@ -9,7 +9,8 @@ server-sent events that Codex understands.
 The translation keeps three promises:
 
 1. Deterministic. The same Responses input always becomes the same Messages
-   request, so Claude's prompt cache keeps hitting across a conversation.
+   request, and every request asks for automatic prompt caching, so Claude's
+   prompt cache keeps hitting across a conversation.
 2. Exact replay. Claude's thinking blocks are only valid if the history they
    were produced in comes back unchanged. Codex keeps the history, but in
    its own item format. So every Claude reply also travels inside one opaque
@@ -22,7 +23,8 @@ The translation keeps three promises:
 3. Graceful. The optional extras (thinking-block binding, refusal fallbacks,
    web search) are betas or org settings that an account may not have. If
    the first attempt is refused with a 400, the request is sent once more
-   without them, and that model and key stay in plain mode for an hour.
+   without them. When the refusal named one of the extras and the plain
+   request went through, that model and key stay in plain mode for an hour.
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 import anthropic
+import httpx2  # the SDK's transport; it does not wrap errors raised mid-stream
 from fastapi.responses import JSONResponse, StreamingResponse
 
 logger = logging.getLogger("den.anthropic")
@@ -66,6 +69,16 @@ _FALLBACK_MODELS = ("claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "cla
 # Models with the dynamic-filtering web search tool; other models get the basic one.
 _NEW_WEB_SEARCH = ("claude-fable-5", "claude-opus-5", "claude-sonnet-5", "claude-opus-4-6",
                    "claude-opus-4-7", "claude-opus-4-8", "claude-sonnet-4-6")
+
+# A 400 about the request itself: retrying without the extras cannot help,
+# and must not switch the key's other agents to plain mode.
+_REQUEST_FAULTS = ("prompt is too long", "image exceeds", "image too large", "media type",
+                   "media_type")
+# Words a refusal of the extras names: a beta header, `fallbacks`,
+# `thinking.block_binding`, or the web search tool. Bare "thinking" is left
+# out on purpose: a bad thinking block in the history is a request fault, and
+# plain mode would only take away `drop_block`, which is what recovers it.
+_EXTRAS_WORDS = ("beta", "fallback", "binding", "prefix_mismatch", "web_search", "web search")
 
 _EFFORTS = {"minimal": "low", "none": "low", "low": "low", "medium": "medium",
             "high": "high", "xhigh": "xhigh", "max": "max"}
@@ -263,6 +276,34 @@ def decode_blob(item: dict[str, Any]) -> list[list[dict[str, Any]]] | None:
     return turns
 
 
+def _replayable(blocks: list[dict[str, Any]]) -> list[bool]:
+    """Which blocks of one Claude reply may be sent back to the API.
+
+    The API refuses empty text blocks on replay. After a mid-output refusal
+    fallback, the declined model's thinking and tool calls before the last
+    `fallback` block must be left out (no tool_result may answer them either),
+    while its text, server tool calls that already have their results, and
+    the `fallback` block itself stay in place.
+    """
+    seam = max((i for i, b in enumerate(blocks) if b.get("type") == "fallback"), default=-1)
+    before = blocks[:max(seam, 0)]
+    server_calls = {b.get("id") for b in before if b.get("type") == "server_tool_use"}
+    paired = server_calls & {b.get("tool_use_id") for b in before
+                             if str(b.get("type", "")).endswith("_tool_result")}
+    keep: list[bool] = []
+    for i, block in enumerate(blocks):
+        kind = block.get("type")
+        if kind == "text":
+            keep.append(bool(block.get("text")))
+        elif i >= seam:
+            keep.append(True)
+        elif kind == "server_tool_use":
+            keep.append(block.get("id") in paired)
+        else:
+            keep.append(str(kind).endswith("_tool_result") and block.get("tool_use_id") in paired)
+    return keep
+
+
 def is_bridge_reasoning(item: Any) -> bool:
     """True for reasoning items this module made (OpenAI cannot read them)."""
     return (
@@ -316,8 +357,13 @@ def _assistant_messages(
                 continue  # OpenAI's encrypted reasoning, or a summary: unusable here
             has_blob = True
             for turn in turns:
-                messages.append({"role": "assistant", "content": turn})
+                # Blobs stored before the filter existed may still hold blocks
+                # the API refuses; a declined tool call dropped here stays
+                # covered so Codex's copy of it is not replayed either.
                 covered.update(b.get("id") for b in turn if b.get("type") == "tool_use")
+                turn = [b for b, keep in zip(turn, _replayable(turn)) if keep]
+                if turn:
+                    messages.append({"role": "assistant", "content": turn})
     content: list[dict[str, Any]] = []
     for item in run:
         kind = item.get("type", "message")
@@ -476,7 +522,11 @@ def translate_request(body: dict[str, Any]) -> tuple[dict[str, Any], ToolMap]:
     if messages[-1]["role"] != "user":
         messages.append({"role": "user", "content": [{"type": "text", "text": "Continue."}]})
 
-    params: dict[str, Any] = {"model": model, "max_tokens": MAX_TOKENS, "messages": messages}
+    # Caching is opt-in: automatic caching puts the breakpoint on the last
+    # cacheable block, so each tool-loop step reads the shared prefix (system,
+    # tools, history) at the cache price. It is GA, so plain mode keeps it.
+    params: dict[str, Any] = {"model": model, "max_tokens": MAX_TOKENS, "messages": messages,
+                              "cache_control": {"type": "ephemeral"}}
     system = "\n\n".join(p for p in system_parts if p)
     if system:
         params["system"] = system
@@ -584,10 +634,16 @@ class _Translator:
         self.response_id = response_id
         self.output_index = 0
         self.turns: list[list[dict[str, Any]]] = []
+        self.last_turn: list[dict[str, Any]] = []  # the latest round's replayable blocks
         self.summaries: list[str] = []
         self.wrote_text = False
         self.usage = _Usage()
         self._open_text: dict[int, str] = {}  # block index -> item id
+        # A `fallback` block only arrives after the declined model's partial
+        # reply, so tool calls and thinking wait for the end of the round
+        # before it is known whether they may be used: (block index, value).
+        self._held_items: list[tuple[int, dict[str, Any]]] = []
+        self._held_thinking: list[tuple[int, str]] = []
         self._counter = 0
 
     def _item_id(self, prefix: str) -> str:
@@ -633,14 +689,14 @@ class _Translator:
                 self.output_index += 1
                 self.wrote_text = self.wrote_text or bool(block.text)
             elif block.type == "tool_use":
-                out += self._done(self._tool_call(block))
+                self._held_items.append((event.index, self._tool_call(block)))
             elif block.type == "server_tool_use" and block.name == "web_search":
                 query = (block.input or {}).get("query") if isinstance(block.input, dict) else None
-                out += self._done({"type": "web_search_call", "id": self._item_id("ws"),
-                                   "status": "completed",
-                                   "action": {"type": "search", "query": str(query or "")}})
+                self._held_items.append((event.index, {
+                    "type": "web_search_call", "id": self._item_id("ws"), "status": "completed",
+                    "action": {"type": "search", "query": str(query or "")}}))
             elif block.type == "thinking" and getattr(block, "thinking", ""):
-                self.summaries.append(block.thinking)
+                self._held_thinking.append((event.index, block.thinking))
         return out
 
     def _tool_call(self, block: Any) -> dict[str, Any]:
@@ -658,9 +714,32 @@ class _Translator:
             item["namespace"] = info["namespace"]
         return item
 
-    def finish_round(self, message: Any) -> None:
-        self.turns.append([b.to_dict(mode="json", exclude_none=True) for b in message.content])
+    def finish_round(self, message: Any) -> list[bytes]:
+        """Store the round for replay and send the tool calls it may make."""
+        blocks = [b.to_dict(mode="json", exclude_none=True) for b in message.content]
+        keep = _replayable(blocks)
+        kept = {i for i, k in enumerate(keep) if k}
+        self.last_turn = [b for b, k in zip(blocks, keep) if k]
+        if self.last_turn:
+            self.turns.append(self.last_turn)
+        self.summaries += [text for i, text in self._held_thinking if i in kept]
+        # Only calls that survive into the replay run: a declined model's
+        # tool call must neither execute nor get a tool_result later.
+        out: list[bytes] = []
+        for i, item in self._held_items:
+            if i in kept:
+                out += self._done(item)
+        self._held_items, self._held_thinking = [], []
         self.usage.add(getattr(message, "usage", None))
+        return out
+
+    def abandon_round(self, stream: Any) -> None:
+        """A round that broke off mid-stream: still count the tokens it used."""
+        try:
+            usage = stream.current_message_snapshot.usage
+        except Exception:  # no message_start yet: nothing was billed
+            return
+        self.usage.add(usage)
 
     def closing(self, stop_reason: str | None) -> list[bytes]:
         out: list[bytes] = []
@@ -718,13 +797,17 @@ async def respond(
         try:
             manager, stream = await _open_stream(client, attempt_params, betas)
         except anthropic.BadRequestError as exc:
-            if not has_extras:
-                raise  # nothing optional to take away: the 400 stands
+            reason = _api_message(exc).lower()
+            if not has_extras or any(w in reason for w in _REQUEST_FAULTS):
+                raise  # nothing optional to take away, or not their fault: the 400 stands
             logger.info("Claude request with extras refused for agent %s (%s); retrying plain",
-                        agent_id, _api_message(exc)[:200])
-            _set_plain_mode(api_key, model)
+                        agent_id, reason[:200])
             attempt_params, betas = params, []
             manager, stream = await _open_stream(client, params, [])
+            # Remember plain mode (for every agent on this key) only when the
+            # refusal named an extra and the plain request then went through.
+            if any(w in reason for w in _EXTRAS_WORDS):
+                _set_plain_mode(api_key, model)
     except anthropic.APIStatusError as exc:
         logger.warning("Anthropic answered %s for agent %s: %s", exc.status_code, agent_id,
                        _api_message(exc)[:200])
@@ -747,16 +830,21 @@ async def respond(
                         for chunk in translator.event(event):
                             yield chunk
                     message = await stream.get_final_message()
+                except BaseException:
+                    translator.abandon_round(stream)
+                    raise
                 finally:
                     await manager.__aexit__(None, None, None)
-                translator.finish_round(message)
+                for chunk in translator.finish_round(message):
+                    yield chunk
                 rounds += 1
-                if message.stop_reason != "pause_turn" or rounds > MAX_PAUSE_CONTINUATIONS:
+                if message.stop_reason != "pause_turn" or rounds > MAX_PAUSE_CONTINUATIONS \
+                        or not translator.last_turn:
                     break
                 # A server tool (web search) paused the turn: send the reply so
                 # far back as-is and let Claude carry on in the same response.
                 attempt_params["messages"] = attempt_params["messages"] + [
-                    {"role": "assistant", "content": translator.turns[-1]}]
+                    {"role": "assistant", "content": translator.last_turn}]
                 manager, stream = await _open_stream(client, attempt_params, betas)
             for chunk in translator.closing(message.stop_reason):
                 yield chunk
@@ -766,9 +854,14 @@ async def respond(
             code = "server_is_overloaded" if exc.status_code in (529, 503) or \
                 "overloaded" in message_text.lower() else "server_error"
             yield _failed(response_id, message_text, code)
-        except anthropic.APIConnectionError as exc:
+        except (anthropic.APIConnectionError, httpx2.TransportError) as exc:
             logger.warning("Claude stream for agent %s dropped: %s", agent_id, exc)
             yield _failed(response_id, "The connection to Anthropic dropped.")
+        except Exception:
+            # Anything else (an unreadable event, say) must still end the
+            # stream with response.failed, or Codex only sees a cut-off body.
+            logger.exception("Claude stream for agent %s broke", agent_id)
+            yield _failed(response_id, "Claude's reply could not be read.")
         finally:
             usage = translator.usage
             if on_usage is not None and (usage.input_tokens or usage.output_tokens):

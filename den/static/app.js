@@ -208,6 +208,16 @@
     return d ? d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }) : "—";
   }
 
+  /**
+   * A date-only "YYYY-MM-DD" (a UTC calendar day from the backend) shown as that same day.
+   * new Date("YYYY-MM-DD") is UTC midnight, so formatting it in the local zone would show
+   * the previous evening west of UTC.
+   */
+  function fmtDay(value) {
+    const d = parseTime(`${value}T00:00:00Z`);
+    return d ? d.toLocaleDateString(undefined, { dateStyle: "medium", timeZone: "UTC" }) : "—";
+  }
+
   function fmtClock(value) {
     const d = parseTime(value);
     if (!d) return "";
@@ -1579,7 +1589,11 @@
       url = href;
     } else if (agentMatch && ws && (href.startsWith("/workspace/") || !href.includes("/") || href.startsWith("./"))) {
       // A file the agent mentions: open its folder in the Files tab.
-      const path = decodeURIComponent(ws[1]).replace(/^\/+/, "");
+      // Model text may hold a stray "%" (for example "50%.txt"), which makes decodeURIComponent
+      // throw; that would abort rendering and, during history replay, the whole agent page.
+      let path;
+      try { path = decodeURIComponent(ws[1]); } catch (err) { path = ws[1]; }
+      path = path.replace(/^\/+/, "");
       const dir = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
       url = `#/agent/${agentMatch[1]}/files?path=${encodeURIComponent(dir)}`;
     }
@@ -1963,6 +1977,19 @@
       }
       const stick = this.isNearBottom();
       const d = ev.data || {};
+      // One event that fails to render must not escape: during history replay it would reject
+      // the session and lock the user out of the agent page, and in a run view it would stall
+      // the transcript. Log it and carry on with the next event.
+      try {
+        this.applyKind(ev, d);
+      } catch (err) {
+        console.error("Could not render an event", ev.kind, err);
+      }
+      this.updateEmpty();
+      if (stick) this.scrollToBottom();
+    }
+
+    applyKind(ev, d) {
       switch (ev.kind) {
         case "turn_started": this.renderTurnStarted(ev.turn_id, d, ev.at); break;
         case "item_started": this.renderItem(ev, false); break;
@@ -1977,8 +2004,6 @@
         case "snapshot": this.applySnapshot(d.turn_id || ev.turn_id, d.items); break;
         default: break; // for example jobs_changed: nothing to draw
       }
-      this.updateEmpty();
-      if (stick) this.scrollToBottom();
     }
 
     // ---- layout helpers ----
@@ -3522,6 +3547,10 @@
           body.base_url = baseUrl.value.trim();
           body.models = modelsInput.value;
           if (!body.base_url) { showErr("Enter the server's base URL."); baseUrl.focus(); return; }
+          // The saved key is only ever sent back to the server it was saved for.
+          if (key && !typed && body.base_url.replace(/\/+$/, "") !== (key.base_url || "")) {
+            showErr("Paste the key again to change the server URL."); keyInput.focus(); return;
+          }
           if (!modelListText(body.models)) { showErr("List at least one model id this server offers."); modelsInput.focus(); return; }
         } else if (modelListText(extraModels.value) !== savedModels) {
           body.models = extraModels.value;
@@ -3630,7 +3659,7 @@
     const days = (res && res.days) || 30;
     const head = h("div", { class: "usage-head" },
       h("h2", { text: `Last ${days} days` }),
-      res && res.since ? h("span", { class: "muted small", text: `Since ${fmtDateTime(res.since)}` }) : null);
+      res && res.since ? h("span", { class: "muted small", text: `Since ${fmtDay(res.since)}` }) : null);
     if (!rows.length) {
       setChildren(card, head, emptyBlock("No model usage yet. It shows up here once your agents answer messages or run jobs."));
       return;

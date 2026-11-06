@@ -16,7 +16,7 @@ from datetime import timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from .context import AppContext, get_ctx
 from .db import iso, new_id, utcnow
@@ -37,23 +37,39 @@ MIN_PASSWORD_LEN, MAX_PASSWORD_LEN = 8, 200
 _dummy_hash: str | None = None
 
 
-class RegisterBody(BaseModel):
+class _TextBody(BaseModel):
+    """JSON may carry lone UTF-16 surrogates ("\\ud800") that Python accepts
+    but cannot encode, so scrypt and SQLite would raise and the request end
+    as a bare 500. Reject them here as ordinary bad input (a 400)."""
+
+    @field_validator("*")
+    @classmethod
+    def _encodable(cls, value: object) -> object:
+        if isinstance(value, str):
+            try:
+                value.encode("utf-8")
+            except UnicodeEncodeError:
+                raise ValueError("contains characters that are not valid text") from None
+        return value
+
+
+class RegisterBody(_TextBody):
     email: str = ""
     password: str = ""
     timezone: str | None = None
 
 
-class LoginBody(BaseModel):
+class LoginBody(_TextBody):
     email: str = ""
     password: str = ""
 
 
-class PasswordBody(BaseModel):
+class PasswordBody(_TextBody):
     current_password: str = ""
     new_password: str = ""
 
 
-class DeleteAccountBody(BaseModel):
+class DeleteAccountBody(_TextBody):
     password: str = ""
 
 
@@ -168,6 +184,11 @@ async def register(
 async def login(body: LoginBody, response: Response, ctx: AppContext = Depends(get_ctx)) -> dict:
     global _dummy_hash
     email = _normalize_email(body.email)
+    # No account can have a malformed or over-long email, so refuse it before
+    # it becomes a login-limiter key (login needs no account, and every
+    # distinct key costs memory until it ages out).
+    if len(email) > MAX_EMAIL_LEN or not EMAIL_RE.match(email):
+        raise HTTPException(401, "Wrong email or password.")
     if not ctx.login_limiter.check(email):
         raise HTTPException(429, "Too many failed logins for this email. Try again in a few minutes.")
     row = ctx.db.one("SELECT * FROM users WHERE email = ?", (email,))
@@ -181,10 +202,18 @@ async def login(body: LoginBody, response: Response, ctx: AppContext = Depends(g
     if row is None or not ok:
         ctx.login_limiter.fail(email)
         raise HTTPException(401, "Wrong email or password.")
+    # scrypt ran off the event loop, so a password change may have committed
+    # meanwhile. Create the session only if the hash we verified is still the
+    # current one, in the same transaction: change_password's UPDATE+DELETE
+    # then lands either before (we refuse) or after (it deletes this session).
+    with ctx.db.transaction() as db:
+        current = db.one("SELECT password_hash FROM users WHERE id = ?", (row["id"],))
+        if current is None or current["password_hash"] != encoded:
+            raise HTTPException(401, "Wrong email or password.")
+        # Opportunistic cleanup so expired sessions do not pile up forever.
+        db.execute("DELETE FROM sessions WHERE expires_at <= ?", (iso(utcnow()),))
+        _start_session(ctx, response, row["id"])
     ctx.login_limiter.reset(email)
-    # Opportunistic cleanup so expired sessions do not pile up forever.
-    ctx.db.execute("DELETE FROM sessions WHERE expires_at <= ?", (iso(utcnow()),))
-    _start_session(ctx, response, row["id"])
     return {"user": user_out(row)}
 
 
@@ -248,9 +277,21 @@ async def delete_account(
     await _check_password(ctx, user, body.password)
     from . import lifecycle  # local: lifecycle imports the bridge, which imports more
 
-    for agent in ctx.db.all("SELECT * FROM agents WHERE user_id = ?", (user["id"],)):
-        await lifecycle.delete_agent(ctx, agent)
-    ctx.db.execute("DELETE FROM users WHERE id = ?", (user["id"],))  # cascades the rest
+    # Sign out every session (this one included) first: deleting agents takes
+    # seconds each, and another tab must not create a new agent meanwhile.
+    ctx.db.execute("DELETE FROM sessions WHERE user_id = ?", (user["id"],))
+    # A create that passed auth before that can still insert a row, and the
+    # users cascade would drop it without removing its files or container.
+    # So repeat until no agents are left, and delete the user only in the
+    # same transaction that sees none (create_agent checks the user exists
+    # inside its own transaction, so nothing can slip in after).
+    while True:
+        for agent in ctx.db.all("SELECT * FROM agents WHERE user_id = ?", (user["id"],)):
+            await lifecycle.delete_agent(ctx, agent)
+        with ctx.db.transaction() as db:
+            if db.one("SELECT 1 FROM agents WHERE user_id = ? LIMIT 1", (user["id"],)) is None:
+                db.execute("DELETE FROM users WHERE id = ?", (user["id"],))  # cascades the rest
+                break
     logger.info("user %s deleted their account", user["id"])
     response = Response(status_code=204)
     response.delete_cookie(

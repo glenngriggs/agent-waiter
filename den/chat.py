@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections import deque
 from typing import Any, AsyncIterator
 
@@ -19,10 +20,11 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from . import codex_bridge
-from .auth import owned_agent
+from .auth import COOKIE_NAME, owned_agent
 from .context import AppContext, get_ctx
 from .db import iso, utcnow
 from .events import row_to_event
+from .security import hash_token
 
 logger = logging.getLogger("den.chat")
 
@@ -32,6 +34,8 @@ MAX_MESSAGE_LEN = 20000
 HISTORY_DEFAULT, HISTORY_MAX = 300, 1000
 REPLAY_BATCH = 500
 PING_SECONDS = 15.0
+# How often an open stream re-checks that its session still exists. Tests may lower it.
+SESSION_CHECK_SECONDS = 15.0
 
 
 class MessageBody(BaseModel):
@@ -110,6 +114,14 @@ async def events(
     )
 
 
+def _session_valid(ctx: AppContext, token_hash: str) -> bool:
+    row = ctx.db.one(
+        "SELECT 1 FROM sessions WHERE token_hash = ? AND expires_at > ?",
+        (token_hash, iso(utcnow())),
+    )
+    return row is not None
+
+
 async def _event_stream(
     ctx: AppContext, request: Request, agent_id: str, after: int
 ) -> AsyncIterator[str]:
@@ -167,7 +179,18 @@ async def _event_stream(
             })
 
         # (4) Live events, oldest first: what was drained, then the queue.
+        # The session was checked only when the stream opened, and a stream
+        # can stay open for days. Re-check it on a timer (not only on ping
+        # timeouts, which a busy stream never hits) so a password change or
+        # an expired session also cuts off streams that are already open.
+        token_hash = hash_token(request.cookies.get(COOKIE_NAME, ""))
+        next_session_check = time.monotonic() + SESSION_CHECK_SECONDS
         while True:
+            if time.monotonic() >= next_session_check:
+                if not _session_valid(ctx, token_hash):
+                    logger.info("SSE session for agent %s is no longer valid; closing", agent_id)
+                    return
+                next_session_check = time.monotonic() + SESSION_CHECK_SECONDS
             if sub.overflowed:
                 # The bus stopped feeding this subscriber. End the stream; the
                 # browser reconnects with Last-Event-ID and replays from SQLite.

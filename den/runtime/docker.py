@@ -22,7 +22,7 @@ from ..agent_files import agent_paths, init_agent_dirs, write_codex_config
 from ..config import Settings
 from ..db import Database
 from ..security import make_agent_token
-from .base import AgentRuntime, AgentRuntimeError
+from .base import AGENT_DELETED_MESSAGE, AgentRuntime, AgentRuntimeError
 
 logger = logging.getLogger("den.runtime.docker")
 
@@ -195,10 +195,17 @@ class DockerRuntime(AgentRuntime):
         Callers may hold a row loaded before a restart bumped token_version;
         baking that stale token into a new container would make every model
         and MCP call fail with 401.
+
+        Raises if the agent was deleted: falling back to the caller's row
+        would recreate the directory and start an orphan container that the
+        idle reaper, which only sees agent rows, would never stop.
         """
         if self.db is None:
             return agent
-        return self.db.one("SELECT * FROM agents WHERE id = ?", (agent["id"],)) or agent
+        fresh = self.db.one("SELECT * FROM agents WHERE id = ?", (agent["id"],))
+        if fresh is None:
+            raise AgentRuntimeError(AGENT_DELETED_MESSAGE)
+        return fresh
 
     # ------------------------------------------------------------------
     # AgentRuntime interface

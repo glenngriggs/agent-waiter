@@ -8,7 +8,8 @@ cat > "$hook" <<'EOF'
 #!/bin/sh
 # Installed by scripts/install-git-hooks.sh: block commits that contain keys.
 root=$(git rev-parse --show-toplevel)
-python3 "$root/scripts/check_secrets.py" || {
+# --staged reads the index: what is committed, even if the files on disk differ.
+python3 "$root/scripts/check_secrets.py" --staged || {
   echo "Commit blocked. Remove the secret (keys belong in .env, which is git-ignored)." >&2
   exit 1
 }
