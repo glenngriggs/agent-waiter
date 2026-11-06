@@ -1,0 +1,33 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # the secret scan reads the whole history
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Secret scan (files and history)
+        run: python scripts/check_secrets.py --history
+
+      - name: Install
+        run: pip install -r requirements.txt
+
+      # The suite runs the real Codex app-server (bundled with the SDK) against
+      # fake model servers, so it needs no keys. Docker tests are opt-in.
+      - name: Test
+        run: python -m pytest -q
