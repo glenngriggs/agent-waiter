@@ -106,6 +106,12 @@ Nothing fails silently. Codex error events that will be retried show as a yellow
 
 Commands that exit non-zero are shown in red with their exit code, because the docs warn a turn can "complete" with every command failed. A failed job run shows its error as the job's last result.
 
+### Development runtime and testing
+
+The container runtime sits behind one small interface (ensure running, stop, restart, remove, status, and "how to launch app-server for this agent"). The product uses the Docker implementation. A second, **local** implementation exists only for development and tests: it runs the app-server binary bundled with the Python SDK directly on the host, with a per-agent `CODEX_HOME`, a clean environment (`env -i`), and the agent's host workspace as its working directory. It provides no isolation, so it must be switched on explicitly (`DEN_RUNTIME=local`) and the web page shows a "development mode" banner while it is on.
+
+The tests drive the real app-server, the real SDK, the real MCP endpoint and the real model proxy against a **scripted fake model** that speaks the Responses API (the same approach a spike used to confirm that the custom provider, streaming and MCP calls work with Codex 0.163). That way the whole chain is tested without credentials or Docker. The Docker code is tested two ways: its exact `docker` command lines against a fake `docker` executable, and an opt-in end-to-end test that runs only where a Docker daemon is available.
+
 ### Key decisions (the ones that are hardest to change later)
 
 | Decision | Choice | What it costs |
@@ -345,7 +351,7 @@ In `chatgpt` mode the two provider sections are omitted (Codex then uses its def
   - `class AgentRuntimeError(Exception)` with `message: str` (user-facing) and `detail: str` (stderr tail for logs).
   - Abstract `class AgentRuntime` with: `name: str`; `async prepare() -> None` (one-time host setup, idempotent); `async ensure_running(agent: dict) -> None` (creates or starts as needed, then writes nothing else); `async stop(agent_id: str) -> None`; `async restart(agent: dict) -> None` (remove, then `ensure_running`); `async remove(agent_id: str) -> None`; `async status(agent_id: str) -> str` returning `running`, `stopped`, `missing` or `unknown`; `codex_config(agent: dict) -> CodexConfig`; `workspace_cwd(agent: dict) -> str`.
   - `agent` dicts are `agents` rows. Implementations hold one `asyncio.Lock` per agent id so concurrent `ensure_running`, `stop` and `restart` calls for one agent serialize.
-- **Why:** lets the product run on Docker and tests run without it (ELEPHANT decision "Testing without Docker").
+- **Why:** lets the product run on Docker and tests run without it (Technical Plan, "Development runtime and testing").
 
 #### `den/runtime/docker.py` (new)
 
@@ -566,7 +572,7 @@ All tests use temporary data directories and never touch `~/.codex` or real cred
   - the probe prompt → "ready".
   - otherwise → "Echo: <first 200 chars of the user text>".
   It records every request (path, headers, JSON body) in `app.state.requests` so tests can assert what Codex sent through the proxy. `run_in_thread(port) -> server` starts it with uvicorn in a daemon thread and returns a handle with `.url` and `.stop()`.
-- **Why:** lets the whole chain run with the real app-server and no credentials (ELEPHANT decision "Testing without Docker").
+- **Why:** lets the whole chain run with the real app-server and no credentials (Technical Plan, "Development runtime and testing").
 
 #### `tests/conftest.py` (new)
 

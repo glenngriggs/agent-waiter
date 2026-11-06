@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Den</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <!-- Shown only when /api/config reports runtime "local" (see app.js boot()). -->
+  <div id="dev-banner" class="dev-banner" hidden>
+    Development mode: agents run directly on this machine without containers. Do not expose this server to other people.
+  </div>
+
+  <header class="topbar">
+    <a class="brand" href="#/agents" aria-label="Den home">
+      <span class="brand-mark" aria-hidden="true">D</span>
+      <span class="brand-name">Den</span>
+    </a>
+    <div id="user-box" class="user-box" hidden>
+      <span id="user-email" class="user-email"></span>
+      <button id="logout-btn" class="btn btn-ghost btn-sm" type="button">Log out</button>
+    </div>
+  </header>
+
+  <main id="app" class="app" aria-live="polite"></main>
+
+  <!-- Transient error and success messages; filled by toast() in app.js. -->
+  <div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+
+  <!-- Plain script on purpose: no modules, no CDN, no build step. -->
+  <script src="/static/app.js"></script>
+</body>
+</html>
