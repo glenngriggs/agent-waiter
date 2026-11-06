@@ -14,7 +14,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel
 
-from . import agent_files, lifecycle
+from . import agent_files, lifecycle, providers
 from . import codex_bridge
 from .auth import current_user, owned_agent
 from .context import AppContext, get_ctx
@@ -32,11 +32,13 @@ CONTAINER_ACTIONS = ("start", "stop", "restart")
 class CreateAgentBody(BaseModel):
     name: str = ""
     model: str = ""
+    provider: str | None = None
 
 
 class PatchAgentBody(BaseModel):
     name: str | None = None
     model: str | None = None
+    provider: str | None = None
 
 
 def _clean_name(raw: str) -> str:
@@ -46,11 +48,25 @@ def _clean_name(raw: str) -> str:
     return name
 
 
-def _check_model(ctx: AppContext, model: str) -> str:
+def _provider_order(ctx: AppContext) -> list[str]:
+    # When a request names only a model: the user's own keys first, then
+    # the shared key.
+    return [p.id for p in providers.user_providers(ctx.settings)] + [providers.PLATFORM]
+
+
+def _check_model(
+    ctx: AppContext, user: dict, model: str, provider: str | None
+) -> tuple[str, str]:
+    """(provider, model) after checking the user may run this model right now."""
     model = model.strip()
-    if model not in ctx.settings.models:
+    candidates = [provider.strip()] if provider else _provider_order(ctx)
+    offering = [p for p in candidates if providers.model_offered(ctx, user["id"], p, model)]
+    if not offering:
         raise HTTPException(400, f"Unknown model '{model}'. Pick one of the offered models.")
-    return model
+    for p in offering:
+        if providers.resolve_credentials(ctx, user["id"], p) is not None:
+            return p, model
+    raise HTTPException(400, providers.no_key_message(ctx.settings, offering[0]))
 
 
 def _agent_status(ctx: AppContext, agent_id: str, state: str, message: str) -> None:
@@ -104,7 +120,7 @@ async def create_agent(
     body: CreateAgentBody, user: dict = Depends(current_user), ctx: AppContext = Depends(get_ctx)
 ) -> dict:
     name = _clean_name(body.name)
-    model = _check_model(ctx, body.model)
+    provider, model = _check_model(ctx, user, body.model, body.provider)
     limit = ctx.settings.max_agents_per_user
     now = iso(utcnow())
     agent_id = new_id()
@@ -115,12 +131,12 @@ async def create_agent(
         if count >= limit:
             raise HTTPException(409, f"You can have at most {limit} agents. Delete one first.")
         db.execute(
-            "INSERT INTO agents (id, user_id, name, model, setup_state, setup_detail, "
+            "INSERT INTO agents (id, user_id, name, model, provider, setup_state, setup_detail, "
             "token_version, chat_thread_id, conversation_no, created_at, last_active_at) "
-            "VALUES (?, ?, ?, ?, 'creating', NULL, 1, NULL, 1, ?, ?)",
-            (agent_id, user["id"], name, model, now, now),
+            "VALUES (?, ?, ?, ?, ?, 'creating', NULL, 1, NULL, 1, ?, ?)",
+            (agent_id, user["id"], name, model, provider, now, now),
         )
-    logger.info("user %s created agent %s (%s)", user["id"], agent_id, model)
+    logger.info("user %s created agent %s (%s on %s)", user["id"], agent_id, model, provider)
     # Setup is owned by the backend, not this request, so it keeps going if
     # the browser leaves the onboarding page.
     ctx.spawn(lifecycle.setup_agent(ctx, agent_id), name=f"setup-agent-{agent_id}")
@@ -134,13 +150,20 @@ async def get_agent(agent: dict = Depends(owned_agent), ctx: AppContext = Depend
 
 @router.patch("/agents/{agent_id}")
 async def patch_agent(
-    body: PatchAgentBody, agent: dict = Depends(owned_agent), ctx: AppContext = Depends(get_ctx)
+    body: PatchAgentBody,
+    agent: dict = Depends(owned_agent),
+    user: dict = Depends(current_user),
+    ctx: AppContext = Depends(get_ctx),
 ) -> dict:
     updates: dict[str, str] = {}
     if body.name is not None:
         updates["name"] = _clean_name(body.name)
     if body.model is not None:
-        updates["model"] = _check_model(ctx, body.model)
+        # A model alone keeps the agent's provider when that still offers it.
+        provider = body.provider
+        if provider is None and providers.model_offered(ctx, user["id"], agent["provider"], body.model.strip()):
+            provider = agent["provider"]
+        updates["provider"], updates["model"] = _check_model(ctx, user, body.model, provider)
     if updates:
         assignments = ", ".join(f"{col} = ?" for col in updates)
         ctx.db.execute(

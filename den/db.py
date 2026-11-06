@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS agents (
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
     model TEXT NOT NULL,
+    provider TEXT NOT NULL DEFAULT 'platform',
     setup_state TEXT NOT NULL,
     setup_detail TEXT,
     token_version INTEGER NOT NULL DEFAULT 1,
@@ -97,6 +98,33 @@ CREATE TABLE IF NOT EXISTS events (
     kind TEXT NOT NULL,
     payload TEXT NOT NULL,
     created_at TEXT NOT NULL
+);
+-- A user's own model API keys, one per provider, encrypted (den/providers.py).
+CREATE TABLE IF NOT EXISTS api_keys (
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL,
+    key_ciphertext TEXT NOT NULL,
+    key_hint TEXT NOT NULL,
+    base_url TEXT,
+    models TEXT NOT NULL DEFAULT '',
+    verified_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, provider)
+);
+-- Token usage per day, recorded by the model proxy. No foreign key to agents,
+-- so a user's totals survive deleting an agent.
+CREATE TABLE IF NOT EXISTS usage_daily (
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    agent_id TEXT NOT NULL,
+    day TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    requests INTEGER NOT NULL DEFAULT 0,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, agent_id, day, provider, model)
 );
 CREATE INDEX IF NOT EXISTS idx_agents_user ON agents(user_id);
 CREATE INDEX IF NOT EXISTS idx_turns_agent_status ON turns(agent_id, status);
@@ -190,7 +218,15 @@ class Database:
                 self._conn.execute(
                     "ALTER TABLE turns ADD COLUMN queue_priority INTEGER NOT NULL DEFAULT 0"
                 )
-            self._conn.execute("PRAGMA user_version = 2")
+            # Version 3 added per-user API keys: agents remember which provider
+            # (and so whose key) their model runs on. Existing agents keep
+            # using the operator's key, which is what they used before.
+            columns = {r["name"] for r in self._conn.execute("PRAGMA table_info(agents)")}
+            if "provider" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE agents ADD COLUMN provider TEXT NOT NULL DEFAULT 'platform'"
+                )
+            self._conn.execute("PRAGMA user_version = 3")
 
     def close(self) -> None:
         with self._lock:

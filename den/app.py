@@ -22,7 +22,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from . import agents, auth, chat, files, jobs, lifecycle, mcp_server, model_proxy
+from . import account, agents, anthropic_bridge, auth, chat, files, jobs, lifecycle, mcp_server, model_proxy
 from . import codex_bridge
 from .codex_bridge import TurnRegistry
 from .config import Settings, load_settings
@@ -179,7 +179,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return JSONResponse({"detail": _validation_message(exc)}, status_code=400)
         return await request_validation_exception_handler(request, exc)
 
-    for module in (auth, agents, chat, files, jobs, mcp_server, model_proxy):
+    for module in (auth, account, agents, chat, files, jobs, mcp_server, model_proxy):
         app.include_router(module.router)
 
     @app.get("/", include_in_schema=False)
@@ -216,5 +216,6 @@ async def _shutdown(
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
     await ctx.http.aclose()
+    await anthropic_bridge.close_clients()
     ctx.db.close()
     logger.info("AgentWaiter stopped")

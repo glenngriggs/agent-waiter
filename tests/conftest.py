@@ -34,6 +34,8 @@ REAL_KEY_VARS = (
     "CODEX_API_KEY",
     "DEN_UPSTREAM_API_KEY",
     "DEN_UPSTREAM_BASE_URL",
+    "ANTHROPIC_API_KEY",
+    "DEN_PLATFORM_KEY_USERS",
 )
 FAKE_UPSTREAM_KEY = "fake-key"
 DEFAULT_PASSWORD = "correct horse battery"
@@ -64,7 +66,9 @@ def make_settings(
     }
     settings = load_settings(env)
     settings = dataclasses.replace(
-        settings, onboarding_probe=True, min_job_interval_minutes=1, idle_stop_minutes=15
+        settings, onboarding_probe=True, min_job_interval_minutes=1, idle_stop_minutes=15,
+        # Every test account may use the fake upstream as the shared key.
+        platform_key_users=("*",), allow_private_provider_urls=True,
     )
     return dataclasses.replace(settings, **overrides)
 

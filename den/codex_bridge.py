@@ -42,6 +42,7 @@ from .agent_files import (
     prepare_scratch_home,
     remove_scratch_home,
 )
+from . import providers
 from .db import iso, new_id, utcnow
 from .runtime.base import AgentRuntimeError
 
@@ -430,9 +431,26 @@ class TurnRunner:
             logger.exception("turn %s crashed", self.turn_id)
             result = ("failed", *classify_exception(exc, self._model))
         finally:
-            await self._finish(result)
+            await self._finish(self._explain_credentials(result))
         assert self.outcome is not None
         return self.outcome
+
+    def _explain_credentials(
+        self, result: tuple[str, str | None, str | None]
+    ) -> tuple[str, str | None, str | None]:
+        """Reword a rejected-key failure for whose key it was."""
+        if result[1] != "unauthorized":
+            return result
+        try:
+            provider_id = self.agent.get("provider") or providers.PLATFORM
+            creds = providers.resolve_credentials(self.ctx, self.agent["user_id"], provider_id)
+            if creds is None:
+                return (result[0], "no_api_key", providers.no_key_message(self.ctx.settings, provider_id))
+            return (result[0], result[1],
+                    providers.rejected_key_message(self.ctx.settings, provider_id, creds.source))
+        except Exception:  # the agent or its user is gone mid-turn: keep the plain message
+            logger.debug("could not reword an unauthorized failure", exc_info=True)
+            return result
 
     async def stop(self, reason: str = "user", *, message: str | None = None) -> None:
         """Interrupt the turn, close the client, and wait for run() to finish.
@@ -480,6 +498,12 @@ class TurnRunner:
         self.agent = ctx.get_agent(self.agent_id) or self.agent
         agent = self.agent
         self._check_stop()
+
+        # No key for the agent's provider: say so now, without starting a
+        # container or Codex only to watch the first model call fail.
+        provider_id = agent.get("provider") or providers.PLATFORM
+        if providers.resolve_credentials(ctx, agent["user_id"], provider_id) is None:
+            return ("failed", "no_api_key", providers.no_key_message(ctx.settings, provider_id))
 
         await self._ensure_container(agent)
         self._check_stop()

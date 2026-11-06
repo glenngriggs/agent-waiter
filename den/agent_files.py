@@ -85,15 +85,17 @@ def remove_agent_dirs(paths: AgentPaths) -> None:
 
 
 _TOOLS_TEXT = """\
-Platform tools (call them from the `exec` tool, for example
-`const r = await tools.mcp__platform__schedule_job({...}); text(JSON.stringify(r));`):
-- `tools.mcp__platform__schedule_job({name, prompt, in_minutes | at | every_minutes | cron, timezone?})`
+Platform tools (an MCP server named `platform`). Depending on your tool setup they
+appear either as direct tools in the `mcp__platform` namespace, or as functions you call
+from the `exec` tool, for example
+`const r = await tools.mcp__platform__schedule_job({...}); text(JSON.stringify(r));`:
+- `schedule_job({name, prompt, in_minutes | at | every_minutes | cron, timezone?})`
   creates a scheduled job for you. Give exactly one of: `in_minutes` (run once that many
   minutes from now), `at` (ISO 8601 time), `every_minutes` (repeat), or `cron` (5-field
   cron expression in the user's timezone). Use it for follow-ups you decide you need and
   for recurring tasks the user asks for.
-- `tools.mcp__platform__list_jobs({})` lists your active jobs.
-- `tools.mcp__platform__cancel_job({job_id})` cancels a job you created.
+- `list_jobs({})` lists your active jobs.
+- `cancel_job({job_id})` cancels a job you created.
 Each job run starts a fresh conversation that sees only the job's prompt, so write job
 prompts that are self-contained (include the context and file paths the run will need).
 The user can see every job and cancel any of them."""

@@ -40,6 +40,7 @@ BROKEN_MODEL = "gpt-ghost"
 AGENT_OUT_KEYS = {
     "id", "name", "model", "setup_state", "setup_detail", "container", "chat_busy",
     "active_turn_id", "conversation_no", "created_at", "last_active_at", "queued_count",
+    "provider", "provider_label",
 }
 
 
@@ -330,7 +331,7 @@ def test_rejected_credentials_end_the_turn_unauthorized(user, agent) -> None:
     done = chat(user, agent["id"], "FAIL401", timeout=90)
     assert done["data"]["status"] == "failed"
     assert done["data"]["error_kind"] == "unauthorized"
-    assert done["data"]["error_message"].startswith("The model provider rejected the platform's credentials")
+    assert done["data"]["error_message"].startswith("The model provider rejected the server's shared key")
     events = [e for e in history(user, agent["id"])["events"] if e["turn_id"] == done["turn_id"]]
     assert any(n["data"]["level"] == "error" for n in events_of(events, "notice"))
     assert get_agent(user, agent["id"])["chat_busy"] is False

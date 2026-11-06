@@ -48,6 +48,15 @@ class LoginBody(BaseModel):
     password: str = ""
 
 
+class PasswordBody(BaseModel):
+    current_password: str = ""
+    new_password: str = ""
+
+
+class DeleteAccountBody(BaseModel):
+    password: str = ""
+
+
 def user_out(row: dict) -> dict:
     return {"id": row["id"], "email": row["email"], "timezone": row["timezone"]}
 
@@ -196,3 +205,55 @@ async def logout(request: Request, ctx: AppContext = Depends(get_ctx)) -> Respon
 @router.get("/me")
 async def me(user: dict = Depends(current_user)) -> dict:
     return {"user": user_out(user)}
+
+
+async def _check_password(ctx: AppContext, user: dict, password: str) -> None:
+    if not ctx.login_limiter.check(user["email"]):
+        raise HTTPException(429, "Too many wrong passwords. Try again in a few minutes.")
+    if not await asyncio.to_thread(verify_password, password, user["password_hash"]):
+        ctx.login_limiter.fail(user["email"])
+        raise HTTPException(400, "The current password is wrong.")
+    ctx.login_limiter.reset(user["email"])
+
+
+@router.post("/password", status_code=204)
+async def change_password(
+    body: PasswordBody,
+    request: Request,
+    user: dict = Depends(current_user),
+    ctx: AppContext = Depends(get_ctx),
+) -> Response:
+    """Change the password and sign out every other session."""
+    await _check_password(ctx, user, body.current_password)
+    if not (MIN_PASSWORD_LEN <= len(body.new_password) <= MAX_PASSWORD_LEN):
+        raise HTTPException(
+            400, f"The new password must be {MIN_PASSWORD_LEN} to {MAX_PASSWORD_LEN} characters."
+        )
+    password_hash = await asyncio.to_thread(hash_password, body.new_password)
+    current = hash_token(request.cookies.get(COOKIE_NAME, ""))
+    with ctx.db.transaction() as db:
+        db.execute("UPDATE users SET password_hash = ? WHERE id = ?", (password_hash, user["id"]))
+        db.execute("DELETE FROM sessions WHERE user_id = ? AND token_hash != ?", (user["id"], current))
+    logger.info("user %s changed their password", user["id"])
+    return Response(status_code=204)
+
+
+@router.post("/delete-account", status_code=204)
+async def delete_account(
+    body: DeleteAccountBody,
+    user: dict = Depends(current_user),
+    ctx: AppContext = Depends(get_ctx),
+) -> Response:
+    """Delete the account: every agent (containers, files, jobs), keys and usage."""
+    await _check_password(ctx, user, body.password)
+    from . import lifecycle  # local: lifecycle imports the bridge, which imports more
+
+    for agent in ctx.db.all("SELECT * FROM agents WHERE user_id = ?", (user["id"],)):
+        await lifecycle.delete_agent(ctx, agent)
+    ctx.db.execute("DELETE FROM users WHERE id = ?", (user["id"],))  # cascades the rest
+    logger.info("user %s deleted their account", user["id"])
+    response = Response(status_code=204)
+    response.delete_cookie(
+        COOKIE_NAME, path="/", httponly=True, samesite="lax", secure=ctx.settings.secure_cookies
+    )
+    return response

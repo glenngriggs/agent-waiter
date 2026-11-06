@@ -3,6 +3,8 @@ uvicorn==0.54.0
 openai-codex==0.163.0
 httpx==0.28.1
 croniter==6.2.4
+anthropic==2.6.0
+cryptography==50.0.2
 python-multipart==0.0.33
 pytest==9.2.0
 pytest-asyncio==1.4.1.post1

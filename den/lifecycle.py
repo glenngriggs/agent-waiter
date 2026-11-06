@@ -15,6 +15,7 @@ from datetime import timedelta
 from typing import Any
 
 from .agent_files import agent_paths, init_agent_dirs, remove_agent_dirs, write_codex_config
+from . import providers
 from .codex_bridge import run_probe
 from .db import iso, utcnow
 from .runtime.base import AgentRuntimeError
@@ -265,6 +266,8 @@ async def agent_out(ctx: Any, agent_row: dict) -> dict:
         "id": agent_id,
         "name": agent_row["name"],
         "model": agent_row["model"],
+        "provider": agent_row.get("provider") or providers.PLATFORM,
+        "provider_label": providers.provider_label(ctx.settings, agent_row.get("provider") or providers.PLATFORM),
         "setup_state": agent_row["setup_state"],
         "setup_detail": agent_row["setup_detail"],
         "container": container,

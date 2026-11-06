@@ -67,9 +67,31 @@ class Settings:
     secure_cookies: bool = False
     session_days: int = 30
     scheduler_max_sleep_seconds: float = 30.0
+    # Who may use the operator's own key (the "platform" provider): emails, or
+    # "*" for everyone. Empty by default, so a public deployment never shares
+    # the operator's key unless the operator says so.
+    platform_key_users: tuple[str, ...] = ()
+    platform_label: str = "Shared key on this server"
+    # Base URL overrides for the providers users bring keys for (tests point
+    # these at fakes; operators can point them at a gateway).
+    provider_base_urls: dict[str, str] = field(default_factory=dict)
+    # Extra model ids offered per provider, from DEN_<PROVIDER>_MODELS.
+    provider_extra_models: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    # User-supplied base URLs (the OpenAI-compatible provider) may not point at
+    # loopback, private or link-local addresses unless this is on, so a public
+    # server cannot be used to reach its own internal network.
+    allow_private_provider_urls: bool = False
+    allow_custom_provider: bool = True
 
     def label_for(self, model_id: str) -> str:
         return self.model_labels.get(model_id, model_id)
+
+    def platform_allowed(self, email: str) -> bool:
+        """True when this account may use the operator's own key."""
+        if self.model_auth != "chatgpt" and not self.upstream_api_key:
+            return False
+        allowed = {e.strip().lower() for e in self.platform_key_users}
+        return "*" in allowed or email.strip().lower() in allowed
 
     @property
     def container_dir(self) -> Path:
@@ -114,6 +136,21 @@ def load_settings(env: Mapping[str, str] = os.environ) -> Settings:
 
     uid_gid = env.get("DEN_CONTAINER_USER", "").strip() or f"{os.getuid()}:{os.getgid()}"
 
+    platform_users = tuple(
+        e.strip().lower() for e in env.get("DEN_PLATFORM_KEY_USERS", "").split(",") if e.strip()
+    )
+    provider_urls: dict[str, str] = {}
+    extra_models: dict[str, tuple[str, ...]] = {}
+    for provider in ("openai", "anthropic", "umgpt"):
+        url = env.get(f"DEN_{provider.upper()}_BASE_URL", "").strip()
+        if url:
+            provider_urls[provider] = url.rstrip("/")
+        extra = tuple(
+            m.strip() for m in env.get(f"DEN_{provider.upper()}_MODELS", "").split(",") if m.strip()
+        )
+        if extra:
+            extra_models[provider] = extra
+
     return Settings(
         # Outside the repo by default: Codex walks up from a workspace looking
         # for AGENTS.md, and must not find this project's course instructions.
@@ -140,6 +177,12 @@ def load_settings(env: Mapping[str, str] = os.environ) -> Settings:
         onboarding_probe=_bool(env.get("DEN_ONBOARDING_PROBE"), True),
         max_upload_mb=_int(env.get("DEN_MAX_UPLOAD_MB"), 100),
         secure_cookies=_bool(env.get("DEN_SECURE_COOKIES"), False),
+        platform_key_users=platform_users,
+        platform_label=env.get("DEN_PLATFORM_LABEL", "").strip() or "Shared key on this server",
+        provider_base_urls=provider_urls,
+        provider_extra_models=extra_models,
+        allow_private_provider_urls=_bool(env.get("DEN_ALLOW_PRIVATE_PROVIDER_URLS"), False),
+        allow_custom_provider=_bool(env.get("DEN_ALLOW_CUSTOM_PROVIDER"), True),
     )
 
 

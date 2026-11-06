@@ -146,13 +146,21 @@ def test_responses_subpaths_are_allowed(server, token, fake_model) -> None:
     assert any(marker in q["path"] for q in fake_model.requests)
 
 
-@pytest.mark.parametrize(
-    "overrides",
-    [{"upstream_api_key": None}, {"model_auth": "chatgpt"}],
-    ids=["no upstream key", "chatgpt mode"],
-)
-def test_no_usable_upstream_key_is_502(fake_model, tmp_path, overrides) -> None:
-    settings = make_settings(tmp_path / "data", fake_model, onboarding_probe=False, **overrides)
+def test_no_upstream_key_refuses_new_agents(fake_model, tmp_path) -> None:
+    # Without the operator's key and without a key of their own, a user is
+    # told to add one before the agent is created, not after it fails.
+    settings = make_settings(tmp_path / "data", fake_model, onboarding_probe=False,
+                             upstream_api_key=None)
+    with running_server(settings) as server, new_client(server) as c:
+        register(c)
+        r = c.post("/api/agents", json={"name": "Keyless", "model": "gpt-6.1-sol"})
+        assert r.status_code == 400
+        assert "Settings" in r.json()["detail"]
+
+
+def test_chatgpt_mode_proxy_is_502(fake_model, tmp_path) -> None:
+    settings = make_settings(tmp_path / "data", fake_model, onboarding_probe=False,
+                             model_auth="chatgpt")
     with running_server(settings) as server, new_client(server) as c:
         register(c)
         agent = create_ready_agent(c, "Keyless")
