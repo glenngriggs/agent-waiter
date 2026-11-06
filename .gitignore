@@ -1,0 +1,65 @@
+# --- Secrets and local config -------------------------------------------
+.env
+.env.*
+!.env.example
+secret.key
+auth.json
+*.pem
+*.key
+
+# --- Den runtime data (database, agent workspaces, Codex homes) ---------
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# --- Python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test, type-check and lint caches
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+
+# --- Node (in case tooling is added) --------------------------------------
+node_modules/
+npm-debug.log*
+
+# --- Logs and temporary files ----------------------------------------------
+*.log
+*.tmp
+*.swp
+*~
+
+# --- Editors and OS ----------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Local agent tool settings (skills in .claude/ and .agents/ stay tracked)
+.claude/settings.local.json
