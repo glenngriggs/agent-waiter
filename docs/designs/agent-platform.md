@@ -71,9 +71,31 @@ Rules that keep this safe and cheap: at most 4 job runs execute at once across t
 
 Neither SDK can register tools, so the backend serves a minimal MCP endpoint over streamable HTTP at `/mcp` (JSON-RPC: `initialize`, `tools/list`, `tools/call`, notifications answered with 202, `GET` answered with 405, matching what the docs verified). Each agent's `config.toml` points Codex at it with `bearer_token_env_var = "PLATFORM_TOKEN"`. The token identifies the agent, so an agent can only see and create its own jobs. Tools: `schedule_job` (exactly one of `in_minutes`, `at`, `every_minutes`, `cron`), `list_jobs`, and `cancel_job`, which may cancel only jobs the agent itself created. User-created jobs can be cancelled only by the user. Testing against Codex 0.163 showed it exposes MCP tools to the model as nested tools reachable from its `exec` tool (`tools.mcp__platform__schedule_job(...)`), so the platform briefing names them explicitly.
 
-### Model credentials: the proxy
+### Model credentials: the proxy and users' own keys
 
-The docs proved a model with a shell can read any key or login placed in its container, and anyone can sign up, so the real key stays in the backend. Each container's `config.toml` defines a provider whose `base_url` is the backend's `/model-proxy/v1` and whose `env_key` is `PLATFORM_TOKEN`. The proxy checks the token, checks the requested model is one the operator offers, swaps in the real key and streams the upstream response back unchanged. The upstream is the U-M GPT Toolkit or OpenAI, chosen by environment variables. For the operator's own testing only, a `chatgpt` mode mounts `~/.codex/auth.json` read-only instead; the README says plainly that the model can read that login.
+The docs proved a model with a shell can read any key or login placed in its container, and anyone can sign up, so no real key ever enters a container. Each container's `config.toml` defines a provider whose `base_url` is the backend's `/model-proxy/v1` and whose `env_key` is `PLATFORM_TOKEN`. The proxy checks the token, finds the agent's **provider**, checks the requested model is one that provider offers, picks the key, and calls the model.
+
+Every agent runs one model from one provider (`agents.provider`):
+
+- **Users' own keys** (`openai`, `anthropic`, `umgpt`, and `custom`, which is any server that implements the OpenAI Responses API). A user adds them on the Settings page. They are encrypted at rest with Fernet, under a key derived by HKDF from the server secret, in `api_keys`. They are never returned to the browser, which only sees the last four characters. Saving one first checks it with a free request: an empty Responses call, or listing Anthropic's models. The check is needed because the Toolkit answers `GET /models` with 200 for any key. A `custom` URL must be public https unless `DEN_ALLOW_PRIVATE_PROVIDER_URLS` is set, so a public server cannot be steered at its own network.
+- **The operator's shared key** (`platform`), which is the key in `.env`. Only accounts in `DEN_PLATFORM_KEY_USERS` may use it, and that list is empty by default. Publishing the code, or running it publicly, therefore never spends the operator's key on strangers. Agents created before this change keep `platform`.
+
+Creating an agent, or switching its model, is refused unless the user can use that provider right now. A turn on an agent whose key was removed fails at once, with error kind `no_api_key` and a message pointing to Settings. It does not start a container only to watch the first call fail. A rejected key is worded by whose key it was: "rejected your API key" for a user's own key, and "the operator needs to check it" for the shared key. For the operator's own testing only, a `chatgpt` mode mounts `~/.codex/auth.json` read-only instead, and in that mode only the shared provider exists. The README says plainly that the model can read that login.
+
+The proxy also records token usage per user, agent, day, provider and model (`usage_daily`). For passed-through replies it reads the usage from the Responses `response.completed` event. The Settings page shows it, with a cost estimate at list prices for Claude models.
+
+### Claude models: the Anthropic bridge
+
+Codex speaks only the OpenAI Responses API, and Anthropic only the Messages API. For an `anthropic` agent the proxy hands the request to `den/anthropic_bridge.py`, which translates it, calls Claude through the official `anthropic` SDK (streaming), and streams the answer back as Responses events. Codex 0.163 gives non-OpenAI models plain function tools, so MCP tools arrive as a `namespace` called `mcp__platform`. The bridge flattens namespaced tools to `mcp__platform__schedule_job`-style names and maps calls back with their `namespace`. The agent briefing describes both forms of the platform tools.
+
+Rules the translation keeps:
+
+- **Exact replay.** Claude's thinking blocks are only valid in the history that produced them, and new Anthropic accounts get a 400 if that history is edited. So each Claude reply also travels in one opaque `reasoning` item whose `encrypted_content` is `den.anthropic.v1:` plus the reply's raw content blocks. Codex stores reasoning items and sends them back untouched (verified in the end-to-end test). The bridge rebuilds that reply from the blob, not from Codex's copies, so it is byte-identical. Requests for models with bound thinking also set `prefix_mismatch_behavior: "drop_block"`. Then a history Codex did rewrite (its local compaction) drops stale blocks instead of failing.
+- **Deterministic.** The same input always gives the same request, so Claude's prompt cache keeps hitting.
+- **Valid by construction.** Leading developer messages become `system`; later ones become user text. An unanswered tool call gets a placeholder error result. A result with no call becomes text. A call to a tool the model is not offered, such as GPT's `exec` after a model switch, becomes text on both sides. An agent switched from Claude to an OpenAI model has Claude's reasoning items stripped before forwarding, because OpenAI rejects reasoning it did not encrypt.
+- **Graceful extras.** Thinking-block binding and server-side refusal fallbacks are betas, and web search is an organisation setting. If a request carrying them is refused with a 400, it is sent once without them, and that key and model stay in plain mode for an hour. `pause_turn` (a long web search) is continued inside the same Responses stream.
+
+Thinking is adaptive with a summarised display, and effort defaults to `medium` or follows Codex's requested effort. `max_tokens` is 64000, streamed.
 
 ### Agent tokens
 
@@ -134,7 +156,8 @@ The tests drive the real app-server, the real SDK, the real MCP endpoint and the
 These were found in review and deliberately left for later; each is a real gap for a public deployment:
 
 - **Disk:** a workspace has no quota, so one agent can fill the host disk (uploads are capped per file, not per user).
-- **Spend and abuse:** there is no sign-up rate limit, no global cap on agents or running containers, and no per-user model budget; anyone who signs up costs the operator tokens.
+- **Spend and abuse:** users pay for their own model calls with their own keys, and the operator's key is shared only with listed accounts. There is still no sign-up rate limit, no global cap on agents or running containers, and no per-user model budget, so a shared key, once given out, is unmetered apart from the usage page.
+- **Key encryption at rest** protects a copied database, not a copied data directory. The encryption key is derived from `secret.key`, which sits next to the database.
 - **Login lockout:** the login limiter is per email, so anyone can lock a user out for 10 minutes with bad passwords.
 - **Egress:** containers have unrestricted outbound network access.
 - **One process:** running turns, the event bus and the scheduler live in one backend process, so it cannot be scaled horizontally without a shared lock and bus.
