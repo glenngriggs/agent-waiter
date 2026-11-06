@@ -53,6 +53,10 @@ Stop calls `interrupt()` on the turn and then closes the client (any reply text 
 
 If the backend dies mid-turn, the in-memory client dies with it. On the next start, any turn or job run still marked `running` is marked `interrupted` with the message "The platform restarted while this was running." The Codex thread itself is safe on disk, so the user's next message continues the same conversation.
 
+**Queueing and interrupting.** A message sent while a chat turn is running is not refused: it waits in the agent's queue (a `turns` row with status `queued`) and runs when the current turn ends, in order. "Interrupt & send" puts the message at the front (`queue_priority` 1) and stops the running turn, which ends `interrupted` with "Interrupted by a newer message."; the interrupting message then starts. A dispatcher that runs whenever a chat turn ends (and at startup, so a queue survives a restart) starts the next waiting message; it has no `await` between choosing and starting, so two can never start at once. Stop ends only the running turn and the queue continues; stopping or restarting the container, or deleting the agent, clears the queue first. At most 10 messages wait per agent. Queued messages appear in a panel above the composer, not in the timeline, until they start.
+
+**Quiet activity.** A turn's tool activity (commands, file edits, tool calls) is shown as one collapsed "Worked · N steps" row that expands on click. A command that fails is not highlighted: models routinely try something, fail and recover. Errors are shown prominently only when the user must act: a failed turn, a failed job run, a setup or container failure.
+
 ### Jobs and the scheduler
 
 Jobs live in SQLite. A job has a name, a prompt, a schedule (once at a time, every N minutes, or a cron expression evaluated in the creator's timezone), who created it (the user or the agent), a status (`active`, `cancelled`, `finished`) and its next run time. One asyncio loop in the backend sleeps until the earliest due job (or at most 30 seconds, or until woken by a change), then fires due jobs.
@@ -178,7 +182,7 @@ These contracts are used by more than one file; every file below follows them ex
 | `users` | `id TEXT PK`, `email TEXT UNIQUE NOT NULL COLLATE NOCASE`, `password_hash TEXT NOT NULL`, `timezone TEXT NOT NULL DEFAULT 'UTC'`, `created_at TEXT NOT NULL` |
 | `sessions` | `token_hash TEXT PK`, `user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE`, `created_at TEXT NOT NULL`, `expires_at TEXT NOT NULL` |
 | `agents` | `id TEXT PK`, `user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE`, `name TEXT NOT NULL`, `model TEXT NOT NULL`, `setup_state TEXT NOT NULL` (`creating`/`ready`/`error`), `setup_detail TEXT`, `token_version INTEGER NOT NULL DEFAULT 1`, `chat_thread_id TEXT`, `conversation_no INTEGER NOT NULL DEFAULT 1`, `created_at TEXT NOT NULL`, `last_active_at TEXT NOT NULL` |
-| `turns` | `id TEXT PK`, `agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE`, `source TEXT NOT NULL` (`chat`/`job`/`probe`), `job_run_id TEXT`, `conversation_no INTEGER NOT NULL`, `prompt TEXT NOT NULL`, `codex_thread_id TEXT`, `codex_turn_id TEXT`, `status TEXT NOT NULL` (`running`/`completed`/`failed`/`interrupted`), `error_kind TEXT`, `error_message TEXT`, `final_response TEXT`, `started_at TEXT NOT NULL`, `finished_at TEXT` |
+| `turns` | `id TEXT PK`, `agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE`, `source TEXT NOT NULL` (`chat`/`job`/`probe`), `job_run_id TEXT`, `conversation_no INTEGER NOT NULL`, `prompt TEXT NOT NULL`, `codex_thread_id TEXT`, `codex_turn_id TEXT`, `status TEXT NOT NULL` (`queued`/`running`/`completed`/`failed`/`interrupted`/`cancelled`), `queue_priority INTEGER NOT NULL DEFAULT 0` (added by migration to schema version 2), `error_kind TEXT`, `error_message TEXT`, `final_response TEXT`, `started_at TEXT NOT NULL`, `finished_at TEXT` |
 | `jobs` | `id TEXT PK`, `agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE`, `name TEXT NOT NULL`, `prompt TEXT NOT NULL`, `schedule_kind TEXT NOT NULL` (`once`/`interval`/`cron`), `schedule_value TEXT NOT NULL` (ISO UTC time / integer minutes as text / cron expression), `timezone TEXT NOT NULL`, `created_by TEXT NOT NULL` (`user`/`agent`), `source_turn_id TEXT`, `status TEXT NOT NULL` (`active`/`cancelled`/`finished`), `next_run_at TEXT` (NULL when nothing is due), `last_run_id TEXT`, `created_at TEXT NOT NULL`, `cancelled_at TEXT` |
 | `job_runs` | `id TEXT PK`, `job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE`, `agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE`, `scheduled_for TEXT NOT NULL`, `status TEXT NOT NULL` (`queued`/`running`/`succeeded`/`failed`/`interrupted`/`skipped`/`missed`), `late INTEGER NOT NULL DEFAULT 0`, `trigger TEXT NOT NULL` (`schedule`/`manual`), `turn_id TEXT`, `summary TEXT`, `error_message TEXT`, `created_at TEXT NOT NULL`, `started_at TEXT`, `finished_at TEXT` |
 | `events` | `seq INTEGER PRIMARY KEY AUTOINCREMENT`, `agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE`, `turn_id TEXT`, `channel TEXT NOT NULL` (`chat`/`job`/`agent`), `kind TEXT NOT NULL`, `payload TEXT NOT NULL` (JSON), `created_at TEXT NOT NULL` |
@@ -191,6 +195,8 @@ Indexes: `agents(user_id)`, `turns(agent_id, status)`, `jobs(agent_id, status)`,
 
 | kind | persisted | data |
 |---|---|---|
+| `turn_queued` | yes | `{prompt, priority, mode}`: a chat message is waiting (same `turn_id` it will start with) |
+| `turn_cancelled` | yes | `{reason}`: a waiting message was removed and will never start |
 | `turn_started` | yes | `{source, prompt, job_id?, run_id?, job_name?}` |
 | `item_started` | yes | `{item_id, item_type, ...summary}` (same fields as `item_completed`, possibly incomplete) |
 | `item_completed` | yes | `{item_id, item_type, ...}`, see the item table below |
@@ -256,10 +262,12 @@ In `chatgpt` mode the two provider sections are omitted (Codex then uses its def
 | `POST /api/agents/{agent_id}/setup/retry` | | 202 `{agent}` | 409 unless `setup_state` is `error` |
 | `POST /api/agents/{agent_id}/container/{action}` | action is `start`, `stop` or `restart` | `{agent}` | 400 unknown action, 409 setup not `ready`, 502 `AgentRuntimeError` |
 | `POST /api/agents/{agent_id}/conversation/new` | | `{agent}` | 409 chat turn running |
-| `GET /api/agents/{agent_id}/history` | `?limit=300` (max 1000) | `{events: [Event], last_seq, active: {turn_id, items} or null}`: the latest `limit` persisted events with channel `chat` or `agent`, oldest first | |
+| `GET /api/agents/{agent_id}/history` | `?limit=300` (max 1000) | `{events: [Event], last_seq, active: {turn_id, items} or null, queue: [{turn_id, prompt, priority, queued_at}]}`: the latest `limit` persisted events with channel `chat` or `agent`, oldest first | |
 | `GET /api/agents/{agent_id}/events` | `?after=<seq>`; header `Last-Event-ID` wins | `text/event-stream` (see `den/chat.py`) | |
-| `POST /api/agents/{agent_id}/messages` | `{text}` (1–20000 chars) | 202 `{turn_id}` | 409 busy or setup not ready |
-| `POST /api/agents/{agent_id}/stop` | | `{stopped: bool}` | |
+| `POST /api/agents/{agent_id}/messages` | `{text, mode?}`, text 1–20000 chars, mode `queue` (default) or `interrupt` | 202 `{turn_id, queued, position}`: runs at once when idle, otherwise waits in the queue | 400 bad mode, 409 queue full (10) or setup not ready |
+| `POST /api/agents/{agent_id}/stop` | | `{stopped: bool}` (stops only the running turn; the queue continues) | |
+| `DELETE /api/agents/{agent_id}/queue/{turn_id}` | | 204; cancels one waiting message | 404 not queued (any more) |
+| `DELETE /api/agents/{agent_id}/queue` | | `{cancelled: n}` | |
 | `GET /api/agents/{agent_id}/files` | `?path=` (relative; empty is the root) | `{path, entries: [{name, path, type: "file"|"dir"|"symlink"|"other", size, modified}]}`, directories first then by name | 400 bad path, 404 missing, 409 not a directory |
 | `GET /api/agents/{agent_id}/files/preview` | `?path=` | `{path, kind: "text"|"image"|"binary", text?, truncated?, size}`; text is the first 1 MiB decoded as UTF-8 (`errors="replace"`) if the first 8 KiB has no NUL byte; `image` for `.png .jpg .jpeg .gif .webp` | 404, 409 directory |
 | `GET /api/agents/{agent_id}/files/download` | `?path=&inline=0|1` | file bytes; `Content-Disposition: attachment` unless `inline=1` **and** the file is one of the four image types; always `X-Content-Type-Options: nosniff` and `Content-Security-Policy: default-src 'none'; sandbox` | 404, 409 directory |
@@ -276,7 +284,7 @@ In `chatgpt` mode the two provider sections are omitted (Codex then uses its def
 | `GET|DELETE /mcp` | | 405 | |
 | `GET|POST /model-proxy/v1/{path}` | `Authorization: Bearer <agent token>` | upstream response streamed | 401, 403 model not allowed, 404 path not allowed, 502 upstream unreachable |
 
-`AgentOut` = `{id, name, model, setup_state, setup_detail, container: "running"|"stopped"|"missing"|"unknown", chat_busy, active_turn_id, conversation_no, created_at, last_active_at}`.
+`AgentOut` = `{id, name, model, setup_state, setup_detail, container: "running"|"stopped"|"missing"|"unknown", chat_busy, active_turn_id, queued_count, conversation_no, created_at, last_active_at}`.
 `JobOut` = `{id, name, prompt, schedule: {kind, value, description, timezone}, created_by, status, next_run_at, last_run: RunOut|null, created_at, cancelled_at}`.
 `RunOut` = `{id, job_id, status, late, trigger, scheduled_for, started_at, finished_at, summary, error_message, turn_id}`.
 `user` = `{id, email, timezone}`.

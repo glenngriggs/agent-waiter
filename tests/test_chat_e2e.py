@@ -39,7 +39,7 @@ from tests.conftest import (
 BROKEN_MODEL = "gpt-ghost"
 AGENT_OUT_KEYS = {
     "id", "name", "model", "setup_state", "setup_detail", "container", "chat_busy",
-    "active_turn_id", "conversation_no", "created_at", "last_active_at",
+    "active_turn_id", "conversation_no", "created_at", "last_active_at", "queued_count",
 }
 
 
@@ -260,13 +260,8 @@ def test_slow_message_can_be_stopped(user, agent) -> None:
     assert user.post(f"/api/agents/{agent['id']}/stop").json() == {"stopped": False}
 
 
-def test_second_message_while_one_is_running_is_409(user, agent) -> None:
+def test_new_conversation_is_refused_while_a_turn_runs(user, agent) -> None:
     turn_id = send_message(user, agent["id"], "SLOW one")
-    r = user.post(f"/api/agents/{agent['id']}/messages", json={"text": "impatient"})
-    assert r.status_code == 409
-    assert r.json()["detail"] == (
-        "The agent is already working on a message. Stop it or wait for it to finish."
-    )
     busy = get_agent(user, agent["id"])
     assert busy["chat_busy"] is True and busy["active_turn_id"] == turn_id
     assert user.post(f"/api/agents/{agent['id']}/conversation/new").status_code == 409

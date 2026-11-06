@@ -774,6 +774,8 @@ class TurnRegistry:
         # Onboarding probes, kept apart so they are stopped on delete and
         # shutdown but never shown as chat or job activity.
         self.probes: dict[str, TurnRunner] = {}  # turn id -> probe runner
+        # False once shutdown begins, so finishing turns do not start queued ones.
+        self.accepting = True
 
     def chat_busy(self, agent_id: str) -> bool:
         return agent_id in self.chat
@@ -790,6 +792,7 @@ class TurnRegistry:
         await self._stop_many(runners, reason)
 
     async def stop_all(self, reason: str = "shutdown") -> None:
+        self.accepting = False
         runners = list(self.chat.values()) + list(self.runs.values()) + list(self.probes.values())
         await self._stop_many(runners, reason)
 
@@ -816,19 +819,151 @@ def _insert_turn(ctx: "AppContext", agent: dict, *, turn_id: str, source: str, p
     )
 
 
-async def start_chat_turn(ctx: "AppContext", agent: dict, text: str) -> str:
-    """Start a chat turn in the background and return its turn id.
+MAX_QUEUED_MESSAGES = 10
+INTERRUPTED_BY_NEWER = "Interrupted by a newer message."
 
-    Raises Busy when a chat turn is already running. There is no await
-    between the busy check and registering the runner, so two simultaneous
-    POSTs cannot both start a turn.
+
+class QueueFull(Exception):
+    """The agent already has MAX_QUEUED_MESSAGES waiting."""
+
+
+def queued_turns(ctx: "AppContext", agent_id: str) -> list[dict]:
+    """The agent's waiting chat messages, next one first.
+
+    Interrupting messages (priority 1) run before ordinary queued ones
+    (priority 0); within a priority, oldest first. While queued, a turn's
+    started_at holds the time it was queued.
     """
+    return ctx.db.all(
+        "SELECT id, prompt, queue_priority, started_at FROM turns "
+        "WHERE agent_id = ? AND source = 'chat' AND status = 'queued' "
+        "ORDER BY queue_priority DESC, started_at ASC",
+        (agent_id,),
+    )
+
+
+def queue_out(row: dict) -> dict:
+    return {
+        "turn_id": row["id"],
+        "prompt": row["prompt"],
+        "priority": int(row["queue_priority"]),
+        "queued_at": row["started_at"],
+    }
+
+
+async def submit_chat_message(
+    ctx: "AppContext", agent: dict, text: str, *, mode: str = "queue"
+) -> dict:
+    """Run a chat message now if the agent is free, otherwise queue it.
+
+    mode "queue" waits behind earlier messages. mode "interrupt" goes to the
+    front of the queue and stops the turn that is running, so it starts as
+    soon as that turn has ended. Returns {turn_id, queued, position}.
+    Raises QueueFull. No await happens between the busy check and starting
+    or queueing, so concurrent submissions keep their order.
+    """
+    if mode not in ("queue", "interrupt"):
+        raise ValueError(f"unknown mode {mode!r}")
     agent_id = agent["id"]
-    if ctx.turns.chat_busy(agent_id):
-        raise Busy("A chat turn is already running for this agent.")
+    waiting = queued_turns(ctx, agent_id)
+    if not ctx.turns.chat_busy(agent_id) and not waiting:
+        turn_id = new_id()
+        _insert_chat_turn(ctx, agent, turn_id=turn_id, prompt=text, status="running", priority=0)
+        _launch_chat_turn(ctx, agent, turn_id, text)
+        return {"turn_id": turn_id, "queued": False, "position": 0}
+
+    if len(waiting) >= MAX_QUEUED_MESSAGES:
+        raise QueueFull(
+            f"The queue is full ({MAX_QUEUED_MESSAGES} messages). "
+            "Wait for some to finish, or cancel queued messages."
+        )
+    priority = 1 if mode == "interrupt" else 0
     turn_id = new_id()
+    _insert_chat_turn(ctx, agent, turn_id=turn_id, prompt=text, status="queued", priority=priority)
+    ctx.emit(
+        agent_id=agent_id, turn_id=turn_id, channel="chat", kind="turn_queued",
+        data={"prompt": text, "priority": priority, "mode": mode},
+    )
+    position = [r["id"] for r in queued_turns(ctx, agent_id)].index(turn_id)
+
+    runner = ctx.turns.chat.get(agent_id)
+    if runner is not None and mode == "interrupt":
+        # Stopping can take a few seconds; do it in the background. When the
+        # runner finishes, its task starts the queue, which begins with this.
+        ctx.spawn(runner.stop("user", message=INTERRUPTED_BY_NEWER), name=f"interrupt-{turn_id}")
+    elif runner is None:
+        # Messages were waiting but nothing was running (for example right
+        # after a restart): start the queue now.
+        dispatch_next(ctx, agent_id)
+    return {"turn_id": turn_id, "queued": True, "position": position}
+
+
+def cancel_queued(ctx: "AppContext", agent_id: str, turn_id: str, reason: str = "Cancelled.") -> bool:
+    """Remove one waiting message. False if it is not queued (any more)."""
+    cur = ctx.db.execute(
+        "UPDATE turns SET status = 'cancelled', error_kind = 'cancelled', error_message = ?, "
+        "finished_at = ? WHERE id = ? AND agent_id = ? AND source = 'chat' AND status = 'queued'",
+        (reason, iso(utcnow()), turn_id, agent_id),
+    )
+    if not cur.rowcount:
+        return False
+    ctx.emit(agent_id=agent_id, turn_id=turn_id, channel="chat", kind="turn_cancelled",
+             data={"reason": reason})
+    return True
+
+
+def cancel_queue(ctx: "AppContext", agent_id: str, reason: str = "Cancelled.") -> int:
+    """Remove every waiting message for the agent; returns how many."""
+    return sum(cancel_queued(ctx, agent_id, row["id"], reason) for row in queued_turns(ctx, agent_id))
+
+
+def dispatch_next(ctx: "AppContext", agent_id: str) -> str | None:
+    """Start the agent's next queued message if nothing is running.
+
+    Called when a chat turn ends and at startup. Synchronous on purpose: with
+    no await inside, two callers can never both start a turn.
+    """
+    if not ctx.turns.accepting or ctx.turns.chat_busy(agent_id):
+        return None
+    agent = ctx.get_agent(agent_id)
+    if agent is None or agent["setup_state"] != "ready":
+        return None
+    for row in queued_turns(ctx, agent_id):
+        # The guarded UPDATE loses to a cancel that got there first.
+        cur = ctx.db.execute(
+            "UPDATE turns SET status = 'running', started_at = ?, conversation_no = ? "
+            "WHERE id = ? AND status = 'queued'",
+            (iso(utcnow()), int(agent["conversation_no"]), row["id"]),
+        )
+        if cur.rowcount:
+            _launch_chat_turn(ctx, agent, row["id"], row["prompt"])
+            return row["id"]
+    return None
+
+
+def resume_queues(ctx: "AppContext") -> int:
+    """At startup, start the queue of every agent that has waiting messages."""
+    rows = ctx.db.all(
+        "SELECT DISTINCT agent_id FROM turns WHERE source = 'chat' AND status = 'queued'"
+    )
+    return sum(1 for r in rows if dispatch_next(ctx, r["agent_id"]))
+
+
+def _insert_chat_turn(
+    ctx: "AppContext", agent: dict, *, turn_id: str, prompt: str, status: str, priority: int
+) -> None:
+    ctx.db.execute(
+        "INSERT INTO turns (id, agent_id, source, job_run_id, conversation_no, prompt, status, "
+        "queue_priority, started_at) VALUES (?, ?, 'chat', NULL, ?, ?, ?, ?, ?)",
+        (turn_id, agent["id"], int(agent["conversation_no"]), prompt, status, priority,
+         iso(utcnow())),
+    )
+
+
+def _launch_chat_turn(ctx: "AppContext", agent: dict, turn_id: str, text: str) -> None:
+    """Start a chat turn whose row is already 'running'. No awaits inside."""
+    agent_id = agent["id"]
     conversation_no = int(agent["conversation_no"])
-    _insert_turn(ctx, agent, turn_id=turn_id, source="chat", prompt=text)
     ctx.emit(
         agent_id=agent_id,
         turn_id=turn_id,
@@ -858,15 +993,25 @@ async def start_chat_turn(ctx: "AppContext", agent: dict, text: str) -> str:
     )
     ctx.turns.chat[agent_id] = runner  # registered before the task exists
 
-    async def run_and_unregister() -> None:
+    async def run_then_next() -> None:
         try:
             await runner.run()
         finally:
             if ctx.turns.chat.get(agent_id) is runner:
                 del ctx.turns.chat[agent_id]
+            try:
+                dispatch_next(ctx, agent_id)  # the queue continues
+            except Exception:
+                logger.exception("starting the next queued message for agent %s failed", agent_id)
 
-    ctx.spawn(run_and_unregister(), name=f"chat-turn-{turn_id}")
-    return turn_id
+    ctx.spawn(run_then_next(), name=f"chat-turn-{turn_id}")
+
+
+async def start_chat_turn(ctx: "AppContext", agent: dict, text: str) -> str:
+    """Start a chat turn now, or raise Busy (kept for callers that never queue)."""
+    if ctx.turns.chat_busy(agent["id"]) or queued_turns(ctx, agent["id"]):
+        raise Busy("A chat turn is already running for this agent.")
+    return (await submit_chat_message(ctx, agent, text))["turn_id"]
 
 
 async def run_probe(ctx: "AppContext", agent: dict) -> TurnOutcome:

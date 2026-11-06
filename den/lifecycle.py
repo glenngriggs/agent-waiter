@@ -229,6 +229,9 @@ async def delete_agent(ctx: Any, agent: dict) -> None:
 
     # 3. Stop the chat turn and any remaining runs, then let them write their
     #    final rows and events while the agent row (their foreign key) exists.
+    # Clear the chat queue first so no queued message starts as turns stop.
+    from .codex_bridge import cancel_queue  # local import: codex_bridge imports this module's peers
+    cancel_queue(ctx, agent_id, "Cancelled: the agent is being deleted.")
     await ctx.turns.stop_agent(agent_id)
     if not await _wait_until_idle(ctx, agent_id, DELETE_DRAIN_SECONDS):
         logger.warning("agent %s still had active turns after %.0f s; deleting anyway",
@@ -265,6 +268,10 @@ async def agent_out(ctx: Any, agent_row: dict) -> dict:
         "setup_state": agent_row["setup_state"],
         "setup_detail": agent_row["setup_detail"],
         "container": container,
+        "queued_count": ctx.db.one(
+            "SELECT COUNT(*) AS n FROM turns WHERE agent_id = ? AND source = 'chat' AND status = 'queued'",
+            (agent_id,),
+        )["n"],
         "chat_busy": ctx.turns.chat_busy(agent_id),
         "active_turn_id": chat_runner.snapshot().get("turn_id") if chat_runner else None,
         "conversation_no": agent_row["conversation_no"],

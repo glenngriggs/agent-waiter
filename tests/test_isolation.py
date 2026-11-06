@@ -49,6 +49,8 @@ AGENT_ROUTES: list[tuple[str, str, dict[str, Any]]] = [
     ("GET", "/api/agents/{a}/events", {"params": {"after": 0}}),
     ("POST", "/api/agents/{a}/messages", {"json": {"text": "hello"}}),
     ("POST", "/api/agents/{a}/stop", {}),
+    ("DELETE", "/api/agents/{a}/queue/{q}", {}),
+    ("DELETE", "/api/agents/{a}/queue", {}),
     ("GET", "/api/agents/{a}/files", {"params": {"path": ""}}),
     ("GET", "/api/agents/{a}/files/preview", {"params": {"path": "secret.txt"}}),
     ("GET", "/api/agents/{a}/files/download", {"params": {"path": "secret.txt"}}),
@@ -64,7 +66,7 @@ AGENT_ROUTES: list[tuple[str, str, dict[str, Any]]] = [
 ]
 
 # Routes that take a job or run id: B's own agent with A's ids must 404 too.
-CHILD_ROUTES = [route for route in AGENT_ROUTES if "{j}" in route[1] or "{r}" in route[1]]
+CHILD_ROUTES = [route for route in AGENT_ROUTES if any(k in route[1] for k in ("{j}", "{r}", "{q}"))]
 
 
 class _Answer:
@@ -110,6 +112,11 @@ def world(fake_model, tmp_path_factory):
             r = a.post(f"/api/agents/{agent_a['id']}/jobs/{job_a['id']}/run")
             assert r.status_code == 202, r.text
             run_a = r.json()["run"]
+            # A busy chat with one queued message, for the queue routes.
+            assert a.post(f"/api/agents/{agent_a['id']}/messages", json={"text": "SLOW keep busy"}).status_code == 202
+            r = a.post(f"/api/agents/{agent_a['id']}/messages", json={"text": "queued for Ana"})
+            assert r.status_code == 202 and r.json()["queued"], r.text
+            queued_a = r.json()["turn_id"]
             yield {
                 "server": server,
                 "settings": server.settings,
@@ -119,11 +126,15 @@ def world(fake_model, tmp_path_factory):
                 "agent_b": agent_b,
                 "job_a": job_a,
                 "run_a": run_a,
+                "queued_a": queued_a,
             }
 
 
 def _ids(world: dict, agent_key: str = "agent_a") -> dict[str, str]:
-    return {"a": world[agent_key]["id"], "j": world["job_a"]["id"], "r": world["run_a"]["id"]}
+    return {
+        "a": world[agent_key]["id"], "j": world["job_a"]["id"],
+        "r": world["run_a"]["id"], "q": world["queued_a"],
+    }
 
 
 @pytest.mark.parametrize("method,template,kwargs", AGENT_ROUTES, ids=[f"{m} {t}" for m, t, _ in AGENT_ROUTES])
@@ -218,3 +229,25 @@ def test_restart_bumps_the_version_and_revokes_the_old_token(world) -> None:
     # The model proxy applies the same check.
     proxied = b.get("/model-proxy/v1/models", headers={"Authorization": f"Bearer {old}"})
     assert proxied.status_code == 401
+
+
+def test_every_agent_route_is_in_the_table() -> None:
+    """A new route under /api/agents/{agent_id} must be added to AGENT_ROUTES,
+    so the two-user checks above cover it; this fails until it is."""
+    from den.app import create_app
+
+    def normalize(path: str) -> str:
+        # Map each route's parameter names to the table's placeholders.
+        return (path.replace("{agent_id}", "{a}").replace("{job_id}", "{j}")
+                .replace("{run_id}", "{r}").replace("{turn_id}", "{q}")
+                .replace("/container/{action}", "/container/start"))
+
+    # The OpenAPI schema lists every route, including those in included
+    # routers (which this FastAPI version does not flatten into app.routes).
+    actual = set()
+    for path, ops in create_app().openapi()["paths"].items():
+        if path.startswith("/api/agents/{agent_id}"):
+            actual |= {(method.upper(), normalize(path)) for method in ops}
+    assert len(actual) > 20, "route discovery found too few routes; the check itself is broken"
+    listed = {(m, t) for m, t, _ in AGENT_ROUTES}
+    assert actual - listed == set(), f"agent routes missing from AGENT_ROUTES: {sorted(actual - listed)}"

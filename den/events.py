@@ -16,6 +16,8 @@ from .db import Database, iso, utcnow
 
 PERSISTED_KINDS = frozenset(
     {
+        "turn_queued",
+        "turn_cancelled",
         "turn_started",
         "item_started",
         "item_completed",

@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel
 
 from . import agent_files, lifecycle
+from . import codex_bridge
 from .auth import current_user, owned_agent
 from .context import AppContext, get_ctx
 from .db import iso, new_id, utcnow
@@ -204,8 +205,11 @@ async def container_action(
             )
             _agent_status(ctx, agent_id, "running", "The container is running.")
         elif action == "stop":
-            # Stop every turn first: closing their clients ends the Codex
-            # processes cleanly and records the turns as interrupted.
+            # Clear the queue first, or the next message would start (and
+            # restart the container) the moment the running turn ends. Then
+            # stop every turn: closing their clients ends the Codex processes
+            # cleanly and records the turns as interrupted.
+            codex_bridge.cancel_queue(ctx, agent_id, "Cancelled: the container was stopped.")
             await ctx.turns.stop_agent(agent_id)
             await ctx.runtime.stop(agent_id)
             _agent_status(
@@ -214,6 +218,7 @@ async def container_action(
             )
         else:
             _agent_status(ctx, agent_id, "restarting", "Recreating the agent's container…")
+            codex_bridge.cancel_queue(ctx, agent_id, "Cancelled: the container was restarted.")
             await ctx.turns.stop_agent(agent_id)
             # restart() bumps token_version, revoking the old container's token.
             await ctx.runtime.restart(agent)

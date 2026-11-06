@@ -36,6 +36,9 @@ PING_SECONDS = 15.0
 
 class MessageBody(BaseModel):
     text: str = ""
+    # "queue": run after anything already running or waiting (the default).
+    # "interrupt": stop the running turn and run this next.
+    mode: str = "queue"
 
 
 def _sse(event: dict[str, Any]) -> str:
@@ -83,6 +86,7 @@ async def history(
         "events": [row_to_event(r) for r in rows],
         "last_seq": last_seq,
         "active": runner.snapshot() if runner is not None else None,
+        "queue": [codex_bridge.queue_out(r) for r in codex_bridge.queued_turns(ctx, agent["id"])],
     }
 
 
@@ -195,15 +199,14 @@ async def send_message(
 ) -> dict:
     if not body.text.strip() or len(body.text) > MAX_MESSAGE_LEN:
         raise HTTPException(400, f"A message must be 1 to {MAX_MESSAGE_LEN} characters.")
+    if body.mode not in ("queue", "interrupt"):
+        raise HTTPException(400, "mode must be 'queue' or 'interrupt'.")
     if agent["setup_state"] != "ready":
         raise HTTPException(409, "This agent is still being set up.")
     try:
-        turn_id = await codex_bridge.start_chat_turn(ctx, agent, body.text)
-    except codex_bridge.Busy:
-        raise HTTPException(
-            409, "The agent is already working on a message. Stop it or wait for it to finish."
-        ) from None
-    return {"turn_id": turn_id}
+        return await codex_bridge.submit_chat_message(ctx, agent, body.text, mode=body.mode)
+    except codex_bridge.QueueFull as exc:
+        raise HTTPException(409, str(exc)) from None
 
 
 @router.post("/stop")
@@ -214,3 +217,17 @@ async def stop(agent: dict = Depends(owned_agent), ctx: AppContext = Depends(get
         return {"stopped": False}
     await runner.stop("user")
     return {"stopped": True}
+
+
+@router.delete("/queue/{turn_id}", status_code=204)
+async def cancel_queued_message(
+    turn_id: str, agent: dict = Depends(owned_agent), ctx: AppContext = Depends(get_ctx)
+) -> None:
+    # Scoped by agent id, so another agent's turn id is simply "not found".
+    if not codex_bridge.cancel_queued(ctx, agent["id"], turn_id):
+        raise HTTPException(404, "That message is not waiting in the queue.")
+
+
+@router.delete("/queue")
+async def clear_queue(agent: dict = Depends(owned_agent), ctx: AppContext = Depends(get_ctx)) -> dict:
+    return {"cancelled": codex_bridge.cancel_queue(ctx, agent["id"])}

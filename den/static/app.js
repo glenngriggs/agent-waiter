@@ -94,6 +94,7 @@
     search: "M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14zM20 20l-4-4",
     sparkle: "M12 3v4M12 17v4M3 12h4M17 12h4M6 6l2.5 2.5M15.5 15.5L18 18M18 6l-2.5 2.5M8.5 15.5L6 18",
     refresh: "M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7",
+    chevron: "M9 6l6 6-6 6",
   };
 
   function icon(name, extraClass) {
@@ -923,6 +924,12 @@
       this.activeTurnId = null;
       this.stopping = false;
       this.busyChangedAt = 0;
+      // Chat messages waiting to run, next first: [{turn_id, prompt, priority, queued_at}].
+      // Built from GET /history's "queue", then kept current by turn_queued (adds) and
+      // turn_started / turn_cancelled (remove). `leftQueue` remembers turns that already
+      // started or were cancelled, so a late POST answer or replayed event cannot re-add them.
+      this.queue = [];
+      this.leftQueue = new Set();
       this.draft = "";
       this.expandedJobs = new Set();
       this.timeline = new Timeline({
@@ -959,6 +966,12 @@
         this.loadingHistory = false;
       }
       this.lastSeq = Math.max(this.lastSeq, Number(history && history.last_seq) || 0);
+      // The server's list is the authority: the replayed turn_queued events may have
+      // scrolled out of the history window.
+      if (history && Array.isArray(history.queue)) {
+        this.queue = [];
+        for (const q of history.queue) this.enqueue(q);
+      }
       const active = history && history.active;
       if (active && active.turn_id) {
         this.partials.set(active.turn_id, new Map(Object.entries(active.items || {})));
@@ -1087,8 +1100,20 @@
           this.notify();
           this.scheduleRefresh();
           break;
+        case "turn_queued":
+          if (ev.channel === "chat") {
+            this.enqueue({ turn_id: ev.turn_id, prompt: d.prompt, priority: d.priority, queued_at: ev.at });
+            this.notify();
+          }
+          break;
+        case "turn_cancelled":
+          if (ev.channel === "chat") this.dequeue(ev.turn_id);
+          break;
         case "turn_started":
-          if (ev.channel === "chat") this.setBusy(true, ev.turn_id);
+          if (ev.channel === "chat") {
+            this.dequeue(ev.turn_id);
+            this.setBusy(true, ev.turn_id);
+          }
           break;
         case "turn_completed":
           this.partials.delete(ev.turn_id);
@@ -1115,6 +1140,30 @@
         default:
           break;
       }
+    }
+
+    /** Add a waiting message in run order: "next" (priority 1) ones before ordinary ones. */
+    enqueue(item) {
+      if (!item || !item.turn_id || this.leftQueue.has(item.turn_id)) return;
+      if (this.queue.some((q) => q.turn_id === item.turn_id)) return;
+      const entry = {
+        turn_id: item.turn_id,
+        prompt: String(item.prompt || ""),
+        priority: Number(item.priority) === 1 ? 1 : 0,
+        queued_at: item.queued_at || null,
+      };
+      const at = entry.priority === 1 ? this.queue.findIndex((q) => q.priority === 0) : -1;
+      if (at < 0) this.queue.push(entry);
+      else this.queue.splice(at, 0, entry);
+    }
+
+    /** A queued message started or was cancelled: it leaves the queue for good. */
+    dequeue(turnId) {
+      if (!turnId) return;
+      this.leftQueue.add(turnId);
+      const before = this.queue.length;
+      this.queue = this.queue.filter((q) => q.turn_id !== turnId);
+      if (this.queue.length !== before) this.notify();
     }
 
     setBusy(busy, turnId) {
@@ -1190,6 +1239,9 @@
   // ======================================================================
   // 7. Timeline renderer (chat and job-run transcripts)
   // ======================================================================
+
+  // The server's error_message for a turn stopped by "Interrupt & send" (codex_bridge.INTERRUPTED_BY_NEWER).
+  const INTERRUPTED_BY_NEWER = "Interrupted by a newer message.";
 
   // Short headings for the red failed-turn card; the server's error_message is the body.
   const ERROR_TITLES = {
@@ -1401,18 +1453,29 @@
     }
   }
 
+  // Tool activity (commands, file changes, tool calls, searches, reasoning) is kept out of the
+  // way: every such item of a turn goes into one collapsed "Worked · N steps" row (see
+  // ActivityGroup). Inside it, rows are neutral even when a command exits non-zero, because a
+  // failing command is a normal part of an agent's work, not something the user must act on.
+  // Each entry below has update(d, completed), finish(reason), `done`, and stepLabel() (a
+  // one-line description for the collapsed row). `visible` is false for rows with nothing to show.
+
   class ReasoningEntry {
     constructor() {
       this.done = false;
+      this.visible = true;
+      this.text = "";
       this.el = h("div", { class: "thinking" }, h("span", { class: "typing" }, h("i"), h("i"), h("i")), h("span", { text: "Thinking…" }));
     }
     update(d, completed) {
       if (!completed) return;
       this.done = true;
       const text = typeof d.text === "string" ? d.text.trim() : "";
+      this.text = text;
       if (!text) {
         // Nothing to show once the thought is over; keep the timeline quiet.
         this.el.hidden = true;
+        this.visible = false;
         return;
       }
       const details = h("details", { class: "thinking thinking-done" },
@@ -1421,9 +1484,14 @@
       this.el.replaceWith(details);
       this.el = details;
     }
+    stepLabel() {
+      return this.done ? "Thought" : "Thinking";
+    }
     finish() {
+      if (this.done) return;
       this.done = true;
       this.el.hidden = true;
+      this.visible = false;
     }
   }
 
@@ -1431,20 +1499,23 @@
     constructor(tl) {
       this.tl = tl;
       this.output = "";
+      this.cmd = "";
       this.done = false;
-      this.failed = false;
-      this.userToggled = false;
+      this.visible = true;
       this.pending = false;
       this.cmdEl = h("code", { class: "tool-cmd" });
       this.badges = h("span", { class: "tool-badges" });
       this.outEl = h("pre", { class: "tool-output", hidden: true });
-      const summary = h("summary", { class: "tool-summary", onclick: () => { this.userToggled = true; } },
+      const summary = h("summary", { class: "tool-summary" },
         icon("terminal", "tool-kind"), this.cmdEl, this.badges);
+      // Output stays collapsed (also while running and when the command failed); the user
+      // opens a row to read it.
       this.el = h("details", { class: "tool tool-command is-running" }, summary, this.outEl);
     }
     update(d, completed) {
       const cmd = Array.isArray(d.command) ? d.command.join(" ") : String(d.command || "");
       if (cmd) {
+        this.cmd = cmd;
         this.cmdEl.textContent = cmd;
         this.cmdEl.title = cmd;
       }
@@ -1454,19 +1525,15 @@
       this.done = completed || status !== "inProgress";
       const exit = d.exit_code;
       const hasExit = exit !== null && exit !== undefined;
-      this.failed = (hasExit && exit !== 0) || status === "failed" || status === "declined";
       const parts = [];
       if (!this.done) parts.push(spinner());
-      // Non-zero exit codes are red: a turn can "complete" with every command failed.
-      if (hasExit) parts.push(badge(`exit ${exit}`, exit === 0 ? "ok" : "danger"));
-      else if (status === "failed" || status === "declined") parts.push(badge(status, "danger"));
+      // The exit code is shown as plain information, never coloured as an error.
+      if (hasExit) parts.push(badge(`exit ${exit}`, "muted"));
+      else if (status === "failed" || status === "declined") parts.push(badge(status, "muted"));
       if (typeof d.duration_ms === "number") parts.push(h("span", { class: "tool-dur", text: fmtDuration(d.duration_ms) }));
       setChildren(this.badges, ...parts);
       this.el.classList.toggle("is-running", !this.done);
-      this.el.classList.toggle("is-failed", this.failed);
       this.renderOutput();
-      // Open while running (live output) and when it failed; collapse successes.
-      if (!this.userToggled) this.el.open = !this.done || this.failed;
     }
     appendOutput(delta) {
       this.output += delta;
@@ -1484,11 +1551,14 @@
       this.outEl.hidden = !text;
       if (!this.done) this.outEl.scrollTop = this.outEl.scrollHeight;
     }
+    stepLabel() {
+      return this.cmd ? `Ran ${this.cmd}` : "Ran a command";
+    }
     finish(reason) {
       if (this.done) return;
       this.done = true;
       this.el.classList.remove("is-running");
-      setChildren(this.badges, badge(reason === "unfinished" ? "did not finish" : "stopped", "warn"));
+      setChildren(this.badges, badge(reason === "unfinished" ? "did not finish" : "stopped", "muted"));
       this.renderOutput();
     }
   }
@@ -1497,6 +1567,8 @@
     constructor(tl) {
       this.tl = tl;
       this.done = false;
+      this.visible = true;
+      this.count = 0;
       this.list = h("ul", { class: "file-changes" });
       this.badges = h("span", { class: "tool-badges" });
       this.el = h("div", { class: "tool tool-files" },
@@ -1507,23 +1579,27 @@
       const status = d.status || (completed ? "completed" : "inProgress");
       this.done = completed || status !== "inProgress";
       const changes = Array.isArray(d.changes) ? d.changes : [];
+      this.count = changes.length;
       setChildren(this.list, ...changes.map((c) => this.changeRow(c || {})));
       const parts = [];
       if (!this.done) parts.push(spinner());
-      if (status === "failed" || status === "declined") parts.push(badge(status, "danger"));
+      if (status === "failed" || status === "declined") parts.push(badge(status, "muted"));
       setChildren(this.badges, ...parts);
     }
     changeRow(change) {
       // `kind` may be a plain string or the SDK's {type: "add"|"delete"|"update"} object.
       const raw = change.kind && typeof change.kind === "object" ? change.kind.type : change.kind;
       const kind = { add: "added", delete: "deleted", update: "edited" }[raw] || raw || "changed";
-      const tone = kind === "added" ? "ok" : kind === "deleted" ? "danger" : "info";
+      const tone = kind === "added" ? "ok" : kind === "edited" ? "info" : "muted";
       const rel = workspaceRelative(change.path);
       let target;
       if (rel === null) target = h("span", { class: "mono", text: String(change.path || "") });
       else if (kind === "deleted") target = h("a", { class: "mono", href: filesHash(this.tl.agentId, dirname(rel)), text: rel || "/" });
       else target = h("a", { class: "mono", href: filesHash(this.tl.agentId, dirname(rel), rel), text: rel || "/" });
       return h("li", null, badge(kind, tone), target);
+    }
+    stepLabel() {
+      return this.count === 1 ? "Changed 1 file" : `Changed ${this.count || "some"} files`;
     }
     finish() {
       this.done = true;
@@ -1534,6 +1610,7 @@
   class McpEntry {
     constructor() {
       this.done = false;
+      this.visible = true;
       this.title = h("span", { class: "tool-title" });
       this.badges = h("span", { class: "tool-badges" });
       this.preview = h("span", { class: "tool-preview" });
@@ -1553,18 +1630,20 @@
       this.done = completed || status !== "inProgress";
       const err = errorText(d.error);
       const failed = status === "failed" || !!err;
-      this.el.classList.toggle("is-failed", failed);
       const parts = [];
       if (!this.done) parts.push(spinner());
-      if (failed) parts.push(badge("failed", "danger"));
+      if (failed) parts.push(badge("failed", "muted"));
       setChildren(this.badges, ...parts);
       const result = typeof d.result_text === "string" ? d.result_text : "";
       const first = (err || result).split("\n")[0];
       this.preview.textContent = first.length > 160 ? first.slice(0, 157) + "…" : first;
-      setChildren(this.body, 
+      setChildren(this.body,
         d.arguments ? h("div", { class: "tool-section" }, h("div", { class: "tool-section-label", text: "Arguments" }), h("pre", { class: "tool-output", text: prettyJson(d.arguments) })) : null,
         result ? h("div", { class: "tool-section" }, h("div", { class: "tool-section-label", text: "Result" }), h("pre", { class: "tool-output", text: result })) : null,
-        err ? h("div", { class: "tool-section" }, h("div", { class: "tool-section-label", text: "Error" }), h("pre", { class: "tool-output tool-error", text: err })) : null);
+        err ? h("div", { class: "tool-section" }, h("div", { class: "tool-section-label", text: "Error" }), h("pre", { class: "tool-output", text: err })) : null);
+    }
+    stepLabel() {
+      return this.title.textContent || "Used a tool";
     }
     finish() {
       this.done = true;
@@ -1577,6 +1656,7 @@
     constructor(kind) {
       this.kind = kind;
       this.done = false;
+      this.visible = true;
       this.label = h("span");
       this.badges = h("span", { class: "tool-badges" });
       this.el = h("div", { class: "tool-line" }, icon(kind === "web_search" ? "search" : "sparkle", "tool-kind"), this.label, this.badges);
@@ -1586,6 +1666,9 @@
       if (this.kind === "web_search") this.label.textContent = d.query ? `Searched the web: ${d.query}` : "Searched the web";
       else this.label.textContent = `Agent step: ${d.raw_type || d.item_type || "unknown"}`;
       setChildren(this.badges, completed ? null : spinner());
+    }
+    stepLabel() {
+      return this.label.textContent || "Worked";
     }
     finish() {
       this.done = true;
@@ -1603,6 +1686,56 @@
       case "web_search": return new LineEntry("web_search");
       case "user_message": return null; // the prompt is already shown from turn_started
       default: return new LineEntry("other");
+    }
+  }
+
+  /**
+   * One collapsed row holding all tool activity of a turn, placed where its first step
+   * appeared: "Working · 2 steps · Ran ls" while the turn runs, "Worked · 4 steps" after.
+   * Expanding it shows the individual rows. Failures are never counted or advertised here.
+   */
+  class ActivityGroup {
+    constructor() {
+      this.entries = [];
+      this.running = true; // until the turn ends (between steps the turn is still working)
+      this.chevron = icon("chevron", "activity-chevron");
+      this.stateEl = h("span", { class: "activity-state" });
+      this.labelEl = h("span", { class: "activity-label" });
+      this.currentEl = h("span", { class: "activity-current" });
+      this.body = h("div", { class: "activity-body" });
+      this.el = h("details", { class: "activity" },
+        h("summary", { class: "activity-summary" }, this.chevron, this.stateEl, this.labelEl, this.currentEl),
+        this.body);
+    }
+    add(entry) {
+      this.entries.push(entry);
+      entry.group = this;
+      this.body.appendChild(entry.el);
+      this.refresh();
+    }
+    finish() {
+      this.running = false;
+      this.refresh();
+    }
+    refresh() {
+      const shown = this.entries.filter((e) => e.visible);
+      const n = shown.length;
+      const steps = n === 1 ? "1 step" : `${n} steps`;
+      // A turn whose only step was an empty thought leaves nothing worth a row.
+      this.el.hidden = !this.running && n === 0;
+      this.el.classList.toggle("is-running", this.running);
+      setChildren(this.stateEl, this.running ? spinner() : icon("check", "activity-done"));
+      if (this.running) {
+        this.labelEl.textContent = n ? `Working · ${steps}` : "Working…";
+        const live = [...this.entries].reverse().find((e) => !e.done) || shown[shown.length - 1];
+        const text = live ? live.stepLabel() : "";
+        this.currentEl.textContent = text;
+        this.currentEl.title = text;
+      } else {
+        this.labelEl.textContent = `Worked · ${steps}`;
+        this.currentEl.textContent = "";
+        this.currentEl.removeAttribute("title");
+      }
     }
   }
 
@@ -1708,7 +1841,7 @@
       const key = turnId || "";
       let t = this.turns.get(key);
       if (!t) {
-        t = { started: false, items: new Set(), hasMessage: false, failedMessage: null, errorNotices: [] };
+        t = { started: false, items: new Set(), hasMessage: false, failedMessage: null, errorNotices: [], activity: null };
         this.turns.set(key, t);
       }
       return t;
@@ -1733,6 +1866,11 @@
     }
 
     renderTurnStarted(turnId, d, at) {
+      // Chat turns run one at a time, so an earlier turn whose end we never saw (for
+      // example cut off by a restart) is over: stop its "Working" row.
+      for (const [id, other] of this.turns) {
+        if (id !== (turnId || "") && other.activity && other.activity.running) other.activity.finish();
+      }
       const t = this.turn(turnId);
       if (t.started) return;
       t.started = true;
@@ -1752,13 +1890,27 @@
       if (!entry) {
         entry = createEntry(this, d.item_type);
         if (!entry) return;
-        this.items.set(key, entry);
-        const t = this.turn(ev.turn_id);
-        t.items.add(key);
-        if (entry instanceof MessageEntry) t.hasMessage = true;
-        this.add(entry.el);
+        this.place(ev.turn_id, key, entry);
       }
       entry.update(d, completed);
+      if (entry.group) entry.group.refresh();
+    }
+
+    /** Put a new entry on the timeline: messages as bubbles, everything else in the turn's activity row. */
+    place(turnId, key, entry) {
+      this.items.set(key, entry);
+      const t = this.turn(turnId);
+      t.items.add(key);
+      if (entry instanceof MessageEntry) {
+        t.hasMessage = true;
+        this.add(entry.el);
+        return;
+      }
+      if (!t.activity) {
+        t.activity = new ActivityGroup();
+        this.add(t.activity.el);
+      }
+      t.activity.add(entry);
     }
 
     messageEntry(turnId, itemId) {
@@ -1766,11 +1918,7 @@
       let entry = this.items.get(key);
       if (!entry) {
         entry = new MessageEntry(this);
-        this.items.set(key, entry);
-        const t = this.turn(turnId);
-        t.items.add(key);
-        t.hasMessage = true;
-        this.add(entry.el);
+        this.place(turnId, key, entry);
       }
       return entry instanceof MessageEntry ? entry : null;
     }
@@ -1786,10 +1934,9 @@
       if (!entry) {
         // Output arrived before (or without) its item_started: draw the row anyway.
         entry = new CommandEntry(this);
-        this.items.set(key, entry);
-        this.turn(turnId).items.add(key);
-        this.add(entry.el);
+        this.place(turnId, key, entry);
         entry.update({ status: "inProgress" }, false);
+        entry.group.refresh();
       }
       if (entry instanceof CommandEntry) entry.appendOutput(String(d.delta || ""));
     }
@@ -1810,9 +1957,11 @@
       const t = turnId ? this.turn(turnId) : null;
       // A failed turn also emits an error notice with the same text; the red card says it once.
       if (level === "error" && t && t.failedMessage === message) return;
+      // Only errors get a banner; info and warnings (for example "Reconnecting to the model…")
+      // are a small muted line, since the user has nothing to do about them.
       let el;
-      if (level === "info") el = h("div", { class: "divider" }, h("span", { text: message }));
-      else el = h("div", { class: `notice notice-${level}`, role: level === "error" ? "alert" : null }, icon("alert"), h("span", { text: message }));
+      if (level === "error") el = h("div", { class: "notice notice-error", role: "alert" }, icon("alert"), h("span", { text: message }));
+      else el = h("div", { class: `quiet-note quiet-note-${level}` }, h("span", { text: message }));
       if (level === "error" && t) t.errorNotices.push({ el, message });
       this.add(el);
     }
@@ -1826,8 +1975,11 @@
         for (const n of t.errorNotices) if (n.message === message) n.el.remove();
         this.add(this.failedCard(d.error_kind, message));
       } else if (d.status === "interrupted") {
-        const message = d.error_kind === "interrupted" || !d.error_message ? "Stopped." : d.error_message;
-        this.add(h("div", { class: "divider divider-warn" }, h("span", { text: message })));
+        // Interrupt-and-send ends the running turn with this exact message; say so instead of "Stopped.".
+        const byNewer = d.error_message === INTERRUPTED_BY_NEWER;
+        const message = byNewer ? INTERRUPTED_BY_NEWER
+          : d.error_kind === "interrupted" || !d.error_message ? "Stopped." : d.error_message;
+        this.add(h("div", { class: "divider divider-muted" }, h("span", { text: message })));
       } else if (d.status === "completed" && !t.hasMessage && d.final_response) {
         // The reply's message item is missing (for example cut off by the history window).
         const entry = new MessageEntry(this);
@@ -1902,6 +2054,7 @@
         const entry = this.items.get(key);
         if (entry && !entry.done) entry.finish(status === "completed" ? "done" : "stopped");
       }
+      if (t.activity) t.activity.finish();
     }
 
     /** Called when the server says nothing is running: no item can still be in progress. */
@@ -1909,6 +2062,7 @@
       for (const entry of this.items.values()) {
         if (!entry.done) entry.finish("unfinished");
       }
+      for (const t of this.turns.values()) if (t.activity && t.activity.running) t.activity.finish();
     }
   }
 
@@ -2118,6 +2272,8 @@
   // ======================================================================
 
   function mountChatTab(body, session) {
+    const isMac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent || "");
+    const modKey = isMac ? "⌘" : "Ctrl";
     const convLabel = h("span", { class: "conv-label" });
     const newConvBtn = h("button", { class: "btn btn-ghost btn-sm", type: "button" }, icon("plus"), "New conversation");
     newConvBtn.addEventListener("click", () => newConversation(session, newConvBtn));
@@ -2129,36 +2285,79 @@
       "aria-label": "Message",
     });
     input.value = session.draft;
-    const sendBtn = h("button", { class: "btn btn-primary composer-send", type: "submit" }, icon("send"), h("span", { text: "Send" }));
+    // While the agent works the composer stays open: Send becomes Queue, and
+    // "Interrupt & send" stops the current task and runs the new message next.
+    const sendLabel = h("span", { text: "Send" });
+    const sendBtn = h("button", { class: "btn btn-primary composer-send", type: "submit" }, icon("send"), sendLabel);
+    const interruptBtn = h("button", {
+      class: "btn composer-interrupt", type: "button", title: `Stop the current task and send this next (${modKey}+Enter)`,
+    }, icon("play"), h("span", { text: "Interrupt & send" }));
     const stopLabel = h("span", { text: "Stop" });
-    const stopBtn = h("button", { class: "btn btn-danger composer-stop", type: "button" }, icon("stop"), stopLabel);
-    const form = h("form", { class: "composer" }, input, h("div", { class: "composer-actions" }, sendBtn, stopBtn));
-    const hint = h("div", { class: "composer-hint", text: "Enter to send · Shift+Enter for a new line" });
+    const stopBtn = h("button", { class: "btn composer-stop", type: "button", title: "Stop the current task. Queued messages still run." }, icon("stop"), stopLabel);
+    const form = h("form", { class: "composer" }, input, h("div", { class: "composer-actions" }, stopBtn, interruptBtn, sendBtn));
+    const hint = h("div", { class: "composer-hint" });
+    const queueList = h("ol", { class: "queue-list" });
+    const queueCount = h("span", { class: "queue-title" });
+    const clearBtn = h("button", { class: "link-btn queue-clear", type: "button", text: "Clear queue" });
+    const queuePanel = h("div", { class: "queue-panel", hidden: true, "aria-label": "Queued messages" },
+      h("div", { class: "queue-head" }, queueCount, clearBtn),
+      queueList);
     const panel = h("div", { class: "chat-panel" },
       h("div", { class: "chat-toolbar" }, convLabel, newConvBtn),
       session.timeline.root,
+      queuePanel,
       form,
       hint);
     body.appendChild(panel);
 
     let sending = false;
     let wasBusy = session.busy;
+    let queueKey = null; // what the queue panel last drew, to skip needless rebuilds
+
+    const renderQueue = () => {
+      const items = session.queue;
+      const key = items.map((q) => `${q.turn_id}:${q.priority}`).join(",");
+      if (key === queueKey) return;
+      queueKey = key;
+      queuePanel.hidden = !items.length;
+      queueCount.textContent = `Queued · ${items.length}`;
+      clearBtn.hidden = items.length < 2;
+      setChildren(queueList, ...items.map((q) => {
+        const oneLine = q.prompt.replace(/\s+/g, " ").trim();
+        const cancel = h("button", {
+          class: "queue-cancel", type: "button", title: "Remove from the queue", "aria-label": "Remove from the queue",
+        }, icon("x"));
+        cancel.addEventListener("click", () => cancelQueued(q.turn_id, cancel));
+        return h("li", { class: "queue-item" },
+          q.priority === 1 ? badge("next", "info") : null,
+          h("span", { class: "queue-text", title: q.prompt, text: oneLine }),
+          cancel);
+      }));
+    };
 
     const update = () => {
       if (!session.agent) return;
       convLabel.textContent = `Conversation ${session.agent.conversation_no || 1}`;
       const busy = session.busy;
+      const waiting = busy || session.queue.length > 0; // a new message would wait
       // Hand the keyboard back when the agent finishes, so the user can reply straight away.
-      if (wasBusy && !busy) requestAnimationFrame(() => input.focus());
+      if (wasBusy && !busy && document.activeElement !== input) requestAnimationFrame(() => input.focus());
       wasBusy = busy;
-      sendBtn.hidden = busy;
+      sendLabel.textContent = waiting ? "Queue" : "Send";
+      sendBtn.title = waiting ? "Run this after the current task (Enter)" : "Send (Enter)";
+      interruptBtn.hidden = !busy;
       stopBtn.hidden = !busy;
       stopBtn.disabled = session.stopping;
       stopLabel.textContent = session.stopping ? "Stopping…" : "Stop";
-      input.disabled = busy || sending;
+      input.disabled = sending;
       sendBtn.disabled = sending;
+      interruptBtn.disabled = sending || session.stopping;
       newConvBtn.disabled = busy;
-      input.placeholder = busy ? "The agent is working. Stop it or wait for it to finish." : `Message ${session.agent.name}…`;
+      input.placeholder = busy ? `Message ${session.agent.name}… (it runs when the current task finishes)` : `Message ${session.agent.name}…`;
+      hint.textContent = busy
+        ? `Enter to queue · ${modKey}+Enter to interrupt and send · Shift+Enter for a new line`
+        : "Enter to send · Shift+Enter for a new line";
+      renderQueue();
     };
 
     const autosize = () => {
@@ -2166,25 +2365,60 @@
       input.style.height = `${Math.min(input.scrollHeight, 220)}px`;
     };
 
-    async function send() {
+    async function send(mode) {
       const text = input.value;
-      if (!text.trim() || session.busy || sending) return;
+      if (!text.trim() || sending) return;
+      const interrupt = mode === "interrupt" && session.busy;
       sending = true;
       update();
       try {
-        const res = await api("POST", agentUrl(session.agentId, "/messages"), { text });
+        const res = await api("POST", agentUrl(session.agentId, "/messages"), { text, mode: interrupt ? "interrupt" : "queue" });
         session.draft = "";
         input.value = "";
         autosize();
-        session.setBusy(true, res.turn_id);
-        session.timeline.addUserMessage(res.turn_id, text);
+        if (res.queued) {
+          // It shows in the timeline only once it starts (turn_started); until then it waits
+          // in the queue panel. The turn_queued event may already have added it.
+          session.enqueue({ turn_id: res.turn_id, prompt: text, priority: interrupt ? 1 : 0, queued_at: new Date().toISOString() });
+          if (interrupt && session.busy) session.setStopping(true);
+          else session.notify();
+        } else {
+          session.setBusy(true, res.turn_id);
+          session.timeline.addUserMessage(res.turn_id, text);
+        }
       } catch (err) {
+        // For example 409 "The queue is full (10 messages)…": the server's text says what to do.
         showError(err);
       } finally {
         sending = false;
         update();
-        if (!session.busy) input.focus();
+        input.focus();
       }
+    }
+
+    async function cancelQueued(turnId, button) {
+      await withBusy(button, async () => {
+        try {
+          await api("DELETE", agentUrl(session.agentId, `/queue/${enc(turnId)}`));
+        } catch (err) {
+          // 404: it already started (its turn_started is on the way) or was cancelled elsewhere.
+          if (err.status !== 404) { showError(err); return; }
+        }
+        session.dequeue(turnId);
+      });
+    }
+
+    async function clearQueue() {
+      await withBusy(clearBtn, async () => {
+        try {
+          await api("DELETE", agentUrl(session.agentId, "/queue"));
+        } catch (err) {
+          showError(err);
+          return;
+        }
+        // turn_cancelled events remove each one; drop them now so the panel reacts at once.
+        for (const q of session.queue.slice()) session.dequeue(q.turn_id);
+      });
     }
 
     async function stop() {
@@ -2202,12 +2436,14 @@
       }
     }
 
-    form.addEventListener("submit", (e) => { e.preventDefault(); send(); });
+    form.addEventListener("submit", (e) => { e.preventDefault(); send("queue"); });
+    interruptBtn.addEventListener("click", () => send("interrupt"));
     stopBtn.addEventListener("click", stop);
+    clearBtn.addEventListener("click", clearQueue);
     input.addEventListener("keydown", (e) => {
       if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
         e.preventDefault();
-        send();
+        send(e.ctrlKey || e.metaKey ? "interrupt" : "queue");
       }
     });
     input.addEventListener("input", () => {

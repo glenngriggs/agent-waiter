@@ -23,6 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from . import agents, auth, chat, files, jobs, lifecycle, mcp_server, model_proxy
+from . import codex_bridge
 from .codex_bridge import TurnRegistry
 from .config import Settings, load_settings
 from .context import AppContext
@@ -137,6 +138,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ctx.scheduler = scheduler
         scheduler.recover_on_startup()
         scheduler.start()
+        # Chat messages that were waiting in a queue when the platform stopped
+        # still belong to the user: start them again.
+        resumed = codex_bridge.resume_queues(ctx)
+        if resumed:
+            logger.info("resumed the chat queue of %d agent(s)", resumed)
 
         # Setup cut off by a restart would otherwise stay "creating" forever.
         cur = db.execute(

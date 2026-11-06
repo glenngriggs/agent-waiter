@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS turns (
     error_kind TEXT,
     error_message TEXT,
     final_response TEXT,
+    queue_priority INTEGER NOT NULL DEFAULT 0,
     started_at TEXT NOT NULL,
     finished_at TEXT
 );
@@ -182,7 +183,14 @@ class Database:
     def migrate(self) -> None:
         with self._lock:
             self._conn.executescript(SCHEMA)
-            self._conn.execute("PRAGMA user_version = 1")
+            # Version 2 added the chat message queue. CREATE TABLE IF NOT
+            # EXISTS does not add columns to an existing table, so do it here.
+            columns = {r["name"] for r in self._conn.execute("PRAGMA table_info(turns)")}
+            if "queue_priority" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE turns ADD COLUMN queue_priority INTEGER NOT NULL DEFAULT 0"
+                )
+            self._conn.execute("PRAGMA user_version = 2")
 
     def close(self) -> None:
         with self._lock:
