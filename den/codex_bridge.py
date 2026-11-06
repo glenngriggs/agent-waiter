@@ -325,6 +325,17 @@ def classify_exception(exc: BaseException, model: str) -> tuple[str, str]:
 # --------------------------------------------------------------------------
 
 
+def _thread_is_gone(exc: BaseException) -> bool:
+    """True when thread_resume failed because the saved thread no longer exists.
+
+    Codex 0.163 answers `no rollout found for thread id <id>` (JSON-RPC
+    -32600) when CODEX_HOME has no record of the thread, and `invalid session
+    id` for an id it cannot parse; both mean there is nothing to resume.
+    """
+    text = str(exc).lower()
+    return "no rollout found" in text or "invalid session id" in text
+
+
 class TurnRunner:
     """Runs exactly one turn and owns its Codex client from start to finish."""
 
@@ -373,6 +384,7 @@ class TurnRunner:
         self._codex: AsyncCodex | None = None
         self._turn: "AsyncTurnHandle | None" = None
         self._turn_error: "TurnError | None" = None  # last non-retried `error` event
+        self._retry_notice_sent = False
         self._result: tuple[str, str | None, str | None] | None = None
         self._finished = asyncio.Event()
 
@@ -559,7 +571,10 @@ class TurnRunner:
             except TransportClosedError:
                 raise  # the process died; starting a new thread would fail too
             except CodexError as exc:
-                if self.stop_requested:
+                if self.stop_requested or not _thread_is_gone(exc):
+                    # Anything else (an active writer, a protocol error) must
+                    # fail this turn: starting a new thread would overwrite
+                    # chat_thread_id and lose the real conversation for good.
                     raise
                 logger.warning(
                     "turn %s: could not resume thread %s (%r); starting a new one",
@@ -610,6 +625,11 @@ class TurnRunner:
             self._emit("command_output", {"item_id": payload.item_id, "delta": payload.delta})
         elif method == "error":
             if payload.will_retry:
+                # Codex retries up to five times; one notice per turn is enough
+                # to explain the wait, and the final failure gets its own card.
+                if self._retry_notice_sent:
+                    return None
+                self._retry_notice_sent = True
                 self._emit(
                     "notice",
                     {
@@ -651,6 +671,15 @@ class TurnRunner:
     async def _finish(self, result: tuple[str, str | None, str | None]) -> None:
         status, error_kind, error_message = result
         await self._close_client()
+        # A reply cut off by Stop, a timeout or a crash never gets its
+        # item/completed, and deltas are not persisted, so save the text that
+        # streamed so far; otherwise a reloaded page shows an empty bubble.
+        for item_id, text in list(self.partial.items()):
+            if text:
+                self._emit(
+                    "item_completed",
+                    {"item_id": item_id, "item_type": "agent_message", "text": text, "partial": True},
+                )
         self.partial.clear()
         self.outcome = TurnOutcome(
             status=status,

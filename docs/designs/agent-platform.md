@@ -49,7 +49,7 @@ An agent is a row in the `agents` table (owner, name, model, the id of its chat 
 5. The browser holds one Server-Sent Events connection per open agent. On connect it sends the last sequence number it has seen; the backend replays anything newer from the table, then streams live events. The text of a reply that is still streaming is kept in memory by the running turn and sent as a snapshot to a browser that connects mid-turn, so a reopened tab picks up exactly where the agent is.
 6. When the turn ends, the client is closed (which ends the app-server process in the container) and the turn row gets its final status, final reply and any error.
 
-Stop calls `interrupt()` on the turn and then closes the client, because the docs show an interrupted turn's running command keeps going until the client is closed. Because each turn has its own client, stopping the chat never stops a scheduled job running in the same container.
+Stop calls `interrupt()` on the turn and then closes the client (any reply text that streamed before the stop is saved as a `partial` agent message, so a reloaded page still shows it), because the docs show an interrupted turn's running command keeps going until the client is closed. Because each turn has its own client, stopping the chat never stops a scheduled job running in the same container. This was verified through real containers: closing the client ends the `docker exec` session, app-server sees end-of-input and exits, and the command it was running dies with it (`tests/test_docker_e2e.py`, Stop test).
 
 If the backend dies mid-turn, the in-memory client dies with it. On the next start, any turn or job run still marked `running` is marked `interrupted` with the message "The platform restarted while this was running." The Codex thread itself is safe on disk, so the user's next message continues the same conversation.
 
@@ -59,11 +59,13 @@ Jobs live in SQLite. A job has a name, a prompt, a schedule (once at a time, eve
 
 Firing a job first advances its `next_run_at` (so a crash cannot fire it twice), records a `job_runs` row, and starts a run task. Each run gets a **fresh Codex thread** in the agent's container with the job prompt and a briefing that says this is an unattended scheduled run. Each run also gets its own SDK client, so cancelling one run never touches another. The run's events go to the same `events` table, tied to the run's turn, so the user can open any run and read exactly what the agent did. When a run ends, the job's last result is updated and a `job_run_finished` card is posted to the agent's chat timeline. This is how a user "comes back to what the agent did while they were gone."
 
+Two app-server processes cannot share one `CODEX_HOME`: when a job run started while a chat turn was running, the second process failed with "failed to initialize sqlite state runtime". So every job run, and the onboarding probe, runs with its **own scratch `CODEX_HOME`** at `codex-home/runs/<turn id>/` (same `config.toml`; passed to `docker exec` as `-e CODEX_HOME=/codex/runs/<id>`). Chat keeps the agent's main `codex-home`. A scratch home is deleted when its run ends, since the run's transcript is already in the `events` table.
+
 Rules that keep this safe and cheap: at most 4 job runs execute at once across the platform (others wait in `queued`); a run is stopped after 30 minutes; if a job's previous run is still going when it comes due again, that occurrence is recorded as `skipped`. Missed runs (the backend was down or the laptop slept): if the run is late by less than 24 hours it runs once now, marked late; if it is later than that, a `missed` run is recorded and the job moves on to its next time. Only one catch-up ever runs, however many occurrences were missed.
 
 ### Agents scheduling their own jobs (MCP)
 
-Neither SDK can register tools, so the backend serves a minimal MCP endpoint over streamable HTTP at `/mcp` (JSON-RPC: `initialize`, `tools/list`, `tools/call`, notifications answered with 202, `GET` answered with 405, matching what the docs verified). Each agent's `config.toml` points Codex at it with `bearer_token_env_var = "PLATFORM_TOKEN"`. The token identifies the agent, so an agent can only see and create its own jobs. Tools: `schedule_job` (exactly one of `in_minutes`, `at`, `every_minutes`, `cron`), `list_jobs`, and `cancel_job`, which may cancel only jobs the agent itself created. User-created jobs can be cancelled only by the user. The spike showed Codex 0.163 exposes MCP tools to the model as nested tools reachable from its `exec` tool (`tools.mcp__platform__schedule_job(...)`), so the platform briefing names them explicitly.
+Neither SDK can register tools, so the backend serves a minimal MCP endpoint over streamable HTTP at `/mcp` (JSON-RPC: `initialize`, `tools/list`, `tools/call`, notifications answered with 202, `GET` answered with 405, matching what the docs verified). Each agent's `config.toml` points Codex at it with `bearer_token_env_var = "PLATFORM_TOKEN"`. The token identifies the agent, so an agent can only see and create its own jobs. Tools: `schedule_job` (exactly one of `in_minutes`, `at`, `every_minutes`, `cron`), `list_jobs`, and `cancel_job`, which may cancel only jobs the agent itself created. User-created jobs can be cancelled only by the user. Testing against Codex 0.163 showed it exposes MCP tools to the model as nested tools reachable from its `exec` tool (`tools.mcp__platform__schedule_job(...)`), so the platform briefing names them explicitly.
 
 ### Model credentials: the proxy
 
@@ -75,7 +77,7 @@ An agent token is `den_<agent_id>_<version>_<hmac>`, where the HMAC is computed 
 
 ### Containers
 
-The image is built from `container/Dockerfile` (`node:22-slim`, CA certificates, git, python3, Codex CLI pinned at 0.166.0, as the docs recommend). The backend builds it on first start if it is missing. `docker run` options for every agent: name `den-agent-<id>`, the two bind mounts, `CODEX_HOME=/codex`, `PLATFORM_TOKEN`, `--user <host uid>:<host gid>` (so files the agent writes are owned by the backend's user and the backend can serve and delete them), `--memory 2g --cpus 1 --pids-limit 512`, `--cap-drop ALL`, `--security-opt no-new-privileges`, `--add-host host.docker.internal:host-gateway`, and the `den-agents` network, created with inter-container traffic disabled. The main process is `sleep infinity`; Codex runs only through `docker exec`.
+The image is built from `container/Dockerfile` (`node:22-slim`, CA certificates, git, python3, Codex CLI pinned at **0.163.0**, the exact version bundled with the Python SDK the backend and tests use, so the protocol and the nested-MCP-tool behaviour are the ones the tests verify). The backend builds it on first start if it is missing. `docker run` options for every agent: name `den-agent-<id>`, the two bind mounts, `CODEX_HOME=/codex`, `PLATFORM_TOKEN`, `--user <host uid>:<host gid>` (so files the agent writes are owned by the backend's user and the backend can serve and delete them), `--memory 2g --cpus 1 --pids-limit 512`, `--cap-drop ALL`, `--security-opt no-new-privileges`, `--init` (so orphaned processes are reaped instead of filling the pids limit), `--add-host host.docker.internal:host-gateway`, and the `den-agents` network, created with inter-container traffic disabled. The main process is `sleep infinity`; Codex runs only through `docker exec`.
 
 Containers are created when the agent is created, started on demand, stopped by an idle reaper after 15 minutes with no running turn or job run, and removed and recreated by the user's Restart button. A stopped container costs nothing but disk.
 
@@ -110,7 +112,7 @@ Commands that exit non-zero are shown in red with their exit code, because the d
 
 The container runtime sits behind one small interface (ensure running, stop, restart, remove, status, and "how to launch app-server for this agent"). The product uses the Docker implementation. A second, **local** implementation exists only for development and tests: it runs the app-server binary bundled with the Python SDK directly on the host, with a per-agent `CODEX_HOME`, a clean environment (`env -i`), and the agent's host workspace as its working directory. It provides no isolation, so it must be switched on explicitly (`DEN_RUNTIME=local`) and the web page shows a "development mode" banner while it is on.
 
-The tests drive the real app-server, the real SDK, the real MCP endpoint and the real model proxy against a **scripted fake model** that speaks the Responses API (the same approach a spike used to confirm that the custom provider, streaming and MCP calls work with Codex 0.163). That way the whole chain is tested without credentials or Docker. The Docker code is tested two ways: its exact `docker` command lines against a fake `docker` executable, and an opt-in end-to-end test that runs only where a Docker daemon is available.
+The tests drive the real app-server, the real SDK, the real MCP endpoint and the real model proxy against a **scripted fake model** that speaks the Responses API (the same approach used before design to confirm that a custom `base_url` provider, streaming and MCP calls under `deny_all` work with Codex 0.163). That way the whole chain is tested without credentials or Docker. The Docker code is tested two ways: its exact `docker` command lines against a fake `docker` executable, and an opt-in end-to-end test that runs only where a Docker daemon is available.
 
 ### Key decisions (the ones that are hardest to change later)
 
@@ -123,6 +125,18 @@ The tests drive the real app-server, the real SDK, the real MCP endpoint and the
 | Schedule | SQLite + in-process scheduler; one late catch-up within 24 h, otherwise `missed`; overlaps `skipped` | Single backend process only (no horizontal scaling without a lock) |
 | Failures | Cause-specific messages in chat and on job runs; onboarding test turn | One tiny model call per new agent |
 
+### Known risks and limits
+
+These were found in review and deliberately left for later; each is a real gap for a public deployment:
+
+- **Disk:** a workspace has no quota, so one agent can fill the host disk (uploads are capped per file, not per user).
+- **Spend and abuse:** there is no sign-up rate limit, no global cap on agents or running containers, and no per-user model budget; anyone who signs up costs the operator tokens.
+- **Login lockout:** the login limiter is per email, so anyone can lock a user out for 10 minutes with bad passwords.
+- **Egress:** containers have unrestricted outbound network access.
+- **One process:** running turns, the event bus and the scheduler live in one backend process, so it cannot be scaled horizontally without a shared lock and bus.
+- **Codex start-up traffic:** each app-server launch in a container runs a short `git` fetch (Codex 0.163 syncing its catalog); it adds a little latency per turn.
+- **Workspace races:** a chat turn and job runs on the same agent can edit the same files at the same time.
+
 ### What is deliberately out of scope
 
 The reach goals (skill library, custom skills, user-added MCP servers, OAuth service logins, sharing files) come after the core and are not designed here. The design leaves room for them: skills would be files in `codex-home/skills/`, and user MCP servers would be extra entries in the generated `config.toml`. Deployment to a real cloud is also out of scope; the platform runs on one host, the student's computer, and users need only a browser.
@@ -133,6 +147,7 @@ The reach goals (skill library, custom skills, user-added MCP servers, OAuth ser
 - **Writing our own client for the raw `codex app-server` JSON-RPC protocol.** Rejected because the docs say the protocol is experimental and changes between versions; the Python SDK speaks it for us.
 - **Running the SDK inside each container behind a small service.** Rejected because it puts our code in every container, the docs did not test it, and `docker exec` was verified. Its one advantage, a turn surviving a backend restart, is covered instead by marking such turns interrupted and resuming the thread.
 - **One long-lived app-server process per agent shared by chat and jobs.** Rejected because Stop has to close the client to kill running commands, which would also kill a job run in progress, and because idle agents would keep processes alive. One client per turn costs about a second of startup per turn.
+- **Letting job runs share the agent's main `CODEX_HOME` with chat.** Rejected because it does not work: a second app-server process on the same `CODEX_HOME` failed with "failed to initialize sqlite state runtime" while a chat turn was running. Each job run and the probe get a scratch `CODEX_HOME` instead.
 - **Running scheduled jobs inside the agent's chat thread.** Rejected because only one client may write to a thread while a turn runs (a job would block on, or collide with, the user's chat), and recurring jobs would fill the chat's context window. Instead each run gets a fresh thread and the chat gets a result card.
 - **Putting the real API key (or `auth.json`) in every container.** Rejected because the docs showed the model can read it from the environment, `/proc` or `CODEX_HOME`, and anyone can sign up; one user could take the operator's key. Kept only as an explicit `chatgpt` testing mode for a single operator.
 - **Codex's `workspace-write` sandbox inside the container.** Rejected because `bwrap` cannot create namespaces in a default container and every command fails (`docs/codex-sdk.md`). The container is the boundary, so Codex runs with full access inside it.
@@ -204,7 +219,7 @@ Item types (`item_type`) and their fields, translated from the SDK's `event.payl
 
 Status enum values from the SDK (for example `McpToolCallStatus.completed`) are sent as their `.value` strings.
 
-**Error kinds** (`turns.error_kind`, used by the UI to choose text and buttons): `unauthorized`, `rate_limited`, `model_unavailable`, `context_full`, `runtime_crashed`, `container_failed`, `timeout`, `interrupted`, `platform_restart`, `other`. Mapping from `TurnError.codex_error_info`: `unauthorized` → `unauthorized`; `usageLimitExceeded`, `rateLimitExceeded`, `sessionBudgetExceeded` → `rate_limited`; `serverOverloaded`, `internalServerError`, `badRequest`, `flexUnavailable` → `model_unavailable`; `contextWindowExceeded` → `context_full`; anything else → `other`. `openai_codex.TransportClosedError` (process died) → `runtime_crashed`. `AgentRuntimeError` → `container_failed`.
+**Error kinds** (`turns.error_kind`, used by the UI to choose text and buttons): `unauthorized`, `rate_limited`, `model_unavailable`, `context_full`, `runtime_crashed`, `container_failed`, `timeout`, `interrupted`, `platform_restart`, `other`. Mapping from `TurnError.codex_error_info`: `unauthorized` → `unauthorized`; `usageLimitExceeded`, `rateLimitExceeded`, `sessionBudgetExceeded` → `rate_limited`; `serverOverloaded`, `internalServerError`, `badRequest`, `flexUnavailable` → `model_unavailable`; `contextWindowExceeded` → `context_full`; anything else → `other`. `openai_codex.TransportClosedError` (process died) → `runtime_crashed`. `AgentRuntimeError` → `container_failed`. Codex 0.163 reports provider HTTP failures as structured variants (for example `httpConnectionFailed` with `httpStatusCode`); their status code decides the kind: 401/403 → `unauthorized`, 429 → `rate_limited`, 404 and 5xx → `model_unavailable`. Codex retries a failing provider up to five times; the platform shows one "Reconnecting…" notice per turn, not one per retry.
 
 **Agent-facing configuration.** `den/agent_files.py` writes `codex-home/config.toml` before every container start and every local launch:
 
@@ -281,15 +296,15 @@ In `chatgpt` mode the two provider sections are omitted (Codex then uses its def
 #### `den/config.py` (new)
 
 - **What changes:** a frozen dataclass `Settings` and `load_settings(env: Mapping[str, str] = os.environ) -> Settings`. Fields, their environment variables and defaults:
-  - `data_dir: Path` (`DEN_DATA_DIR`, `./data`, resolved to an absolute path)
+  - `data_dir: Path` (`DEN_DATA_DIR`, `~/.local/share/den`, resolved to an absolute path; outside the repository because Codex looks for `AGENTS.md` from a workspace up to its git root, and must not find this project's course instructions)
   - `runtime: str` (`DEN_RUNTIME`, `docker`; `local` allowed; anything else raises `ValueError`)
-  - `host: str` (`DEN_HOST`; default `0.0.0.0` for docker, `127.0.0.1` for local), `port: int` (`DEN_PORT`, `8000`)
+  - `host: str` (`DEN_HOST`; default `127.0.0.1` for both runtimes: Docker Desktop containers reach a WSL server bound to 127.0.0.1 through `host.docker.internal` (verified), which keeps `/mcp` and `/model-proxy` off the network; native Linux Docker needs `0.0.0.0` or the bridge IP; an empty value means the default), `port: int` (`DEN_PORT`, `8000`)
   - `agent_backend_url: str` (`DEN_AGENT_BACKEND_URL`; default `http://host.docker.internal:<port>` for docker, `http://127.0.0.1:<port>` for local): the URL agents use for the model proxy and MCP
   - `model_auth: str` (`DEN_MODEL_AUTH`, `proxy`; or `chatgpt`)
   - `upstream_base_url: str` and `upstream_api_key: str|None`: `DEN_UPSTREAM_BASE_URL` and `DEN_UPSTREAM_API_KEY` if set; otherwise if `UMGPT_TOOLKIT_API_KEY` is set use it with `https://api.toolkit.umgpt.umich.edu/v1`; otherwise if `OPENAI_API_KEY` is set use it with `https://api.openai.com/v1`; otherwise base `https://api.openai.com/v1` and key `None` (the proxy then answers 502 "no upstream key configured")
   - `chatgpt_auth_json: Path` (`DEN_CHATGPT_AUTH_JSON`, `~/.codex/auth.json`)
   - `models: tuple[str, ...]` (`DEN_MODELS`, comma separated, default `gpt-6.1-sol,gpt-6-luna`) and `model_labels: dict[str, str]` (built-in labels "GPT-6.1 Sol (strongest)" and "GPT-6 Luna (fast, low cost)"; unknown ids are labelled with the id)
-  - `agent_image: str` (`DEN_AGENT_IMAGE`, `den-agent:0.166.0`), `docker_network: str` (`den-agents`), `container_memory: str` (`2g`), `container_cpus: str` (`1.0`), `container_pids: int` (`512`), `container_uid_gid: str` (`DEN_CONTAINER_USER`, default `f"{os.getuid()}:{os.getgid()}"`)
+  - `agent_image: str` (`DEN_AGENT_IMAGE`, `den-agent:0.163.0`), `docker_network: str` (`den-agents`), `container_memory: str` (`2g`), `container_cpus: str` (`1.0`), `container_pids: int` (`512`), `container_uid_gid: str` (`DEN_CONTAINER_USER`, default `f"{os.getuid()}:{os.getgid()}"`)
   - `codex_bin: str|None` (`DEN_CODEX_BIN`; local runtime only; default `None`, meaning the binary bundled with the SDK)
   - `idle_stop_minutes: int` (`DEN_IDLE_STOP_MINUTES`, 15), `min_job_interval_minutes: int` (`DEN_MIN_JOB_INTERVAL_MINUTES`, 5), `max_jobs_per_agent: int` (20), `max_agents_per_user: int` (`DEN_MAX_AGENTS_PER_USER`, 5), `max_concurrent_job_runs: int` (`DEN_MAX_CONCURRENT_JOB_RUNS`, 4), `job_run_timeout_minutes: int` (`DEN_JOB_RUN_TIMEOUT_MINUTES`, 30), `missed_run_grace_hours: int` (24), `onboarding_probe: bool` (`DEN_ONBOARDING_PROBE`, true), `probe_timeout_seconds: int` (90), `max_upload_mb: int` (`DEN_MAX_UPLOAD_MB`, 100), `secure_cookies: bool` (`DEN_SECURE_COOKIES`, false), `session_days: int` (30), `scheduler_max_sleep_seconds: float` (30.0)
   - Booleans parse `1/true/yes/on` case-insensitively.
@@ -337,6 +352,7 @@ In `chatgpt` mode the two provider sections are omitted (Codex then uses its def
   - `init_agent_dirs(paths)` creates the three directories with mode 0700 for `root` and 0755 for the children.
   - `write_codex_config(settings, paths, model: str)` writes `config.toml` as in 4.1, writing to a temporary file and renaming it.
   - `remove_agent_dirs(paths)` uses `shutil.rmtree` (which does not follow symlinks on Linux).
+  - `prepare_scratch_home(settings, paths, model, key) -> str` creates `codex-home/runs/<key>/` with its own `config.toml` (and, in `chatgpt` mode, a relative `auth.json` link to the parent's) and returns the subdirectory; `remove_scratch_home(paths, key)` deletes it. `AgentRuntime.codex_config(agent, codex_home_subdir=None)` launches app-server with that directory as `CODEX_HOME`; `TurnRunner(..., scratch_home=True)` uses it for job runs and the probe.
   - `developer_instructions(agent_name: str, *, purpose: str, job_name: str | None = None) -> str` where `purpose` is `chat`, `job` or `probe`. The text names the agent; says the user's files live in the current working directory (the workspace) and that anything the user should see must be saved there; says it runs in its own container; describes the three platform tools by their exact nested names `tools.mcp__platform__schedule_job`, `tools.mcp__platform__list_jobs` and `tools.mcp__platform__cancel_job` (callable from the `exec` tool), their arguments, that each run starts a fresh conversation (so job prompts must be self-contained), and that the user can see and cancel every job. For `job` it adds: "This is an unattended scheduled run of the job '<name>'. Nobody is watching. Do the task, then end with a short summary of what you did; that summary is shown to the user as the job's result." For `probe`: "Reply with the single word: ready."
 - **Why:** "What an agent is", "Agent-facing configuration" and the MCP section of the Technical Plan.
 
@@ -385,7 +401,7 @@ In `chatgpt` mode the two provider sections are omitted (Codex then uses its def
     - `async run() -> TurnOutcome`:
       1. Calls `ctx.runtime.ensure_running(agent)` and emits `agent_status` `{state: "starting", step: "container", message: "Starting the agent's container…"}` only when `status()` was not `running`.
       2. Opens `AsyncCodex(ctx.runtime.codex_config(agent))`.
-      3. If `thread_id` is set, calls `thread_resume(thread_id, model=agent["model"], cwd=..., sandbox=Sandbox.full_access, approval_mode=ApprovalMode.deny_all, developer_instructions=...)`. If that raises a `CodexError` (thread missing), it emits a warning `notice` ("The previous conversation could not be restored, so a new one was started.") and falls back to `thread_start` with the same options plus `ephemeral`. When a new thread starts, it calls `on_thread_started(thread.id)`.
+      3. If `thread_id` is set, calls `thread_resume(thread_id, model=agent["model"], cwd=..., sandbox=Sandbox.full_access, approval_mode=ApprovalMode.deny_all, developer_instructions=...)`. If that raises a `CodexError` whose message says the thread does not exist (`no rollout found for thread id` or `invalid session id`, which is what Codex 0.163 answers), it emits a warning `notice` ("The previous conversation could not be restored, so a new one was started.") and falls back to `thread_start` with the same options plus `ephemeral`. Any other resume error fails the turn instead, because starting a new thread would overwrite `chat_thread_id` and lose the real conversation. When a new thread starts, it calls `on_thread_started(thread.id)`.
       4. `turn = await thread.turn(prompt)`; stores `codex_thread_id`/`codex_turn_id` on the `turns` row.
       5. `async for ev in turn.stream()`: `item/started` → `item_started`; `item/completed` → `item_completed` (and remembers the last `agent_message` text as the final response); `item/agentMessage/delta` → `message_delta` (and appends to `self.partial[item_id]`); `item/commandExecution/outputDelta` → `command_output`; `error` with `will_retry` → `notice` warning "Reconnecting to the model… (<message>)", without `will_retry` → remembered as the turn error; `turn/completed` → final status from `payload.turn.status` and error from `payload.turn.error`. Other methods are ignored.
       6. On `TransportClosedError` or any `CodexError`: if `self.stop_requested` the outcome is `interrupted` (`error_kind="interrupted"`, message "Stopped."); otherwise `failed` with `classify_exception`. On `AgentRuntimeError`: `failed` with `container_failed` and the error's message.
@@ -474,7 +490,7 @@ In `chatgpt` mode the two provider sections are omitted (Codex then uses its def
     - `list_jobs({})`: JSON text of the agent's active jobs: `id`, `name`, `schedule` description, `next_run_at`, `created_by`, last run status and summary.
     - `cancel_job({job_id})`: the job must belong to this agent; if `created_by == "user"` it returns an error result "Only the user can cancel this job because they created it."; otherwise calls `cancel_job` and returns "Cancelled job <id>."
   - Tool failures (for example a `ScheduleError`) return `{content: [{type: "text", text: <message>}], isError: true}` so the model can read the reason and try again.
-- **Why:** "Agents scheduling their own jobs (MCP)"; the response codes follow what `docs/codex-sdk.md` verified, and the spike confirmed Codex 0.163 calls it under `deny_all`.
+- **Why:** "Agents scheduling their own jobs (MCP)"; the response codes follow what `docs/codex-sdk.md` verified, and the test suite confirms Codex 0.163 calls it under `deny_all`.
 
 #### `den/model_proxy.py` (new)
 
@@ -525,13 +541,13 @@ In `chatgpt` mode the two provider sections are omitted (Codex then uses its def
 
 #### `container/Dockerfile` (new)
 
-- **What changes:** `FROM node:22-slim`; `apt-get install -y --no-install-recommends ca-certificates git python3 python3-pip python3-venv curl procps less` and clean the apt lists; `npm install -g @openai/codex@0.166.0`; `mkdir -p /workspace /codex /home/agent && chmod 1777 /home/agent /codex /workspace`; `ENV CODEX_HOME=/codex HOME=/home/agent`; `WORKDIR /workspace`; `CMD ["sleep", "infinity"]`.
+- **What changes:** `FROM node:22-slim`; `apt-get install -y --no-install-recommends ca-certificates git python3 python3-pip python3-venv curl procps less` and clean the apt lists; `npm install -g @openai/codex@0.163.0`; `mkdir -p /workspace /codex /home/agent && chmod 1777 /home/agent /codex /workspace`; `ENV CODEX_HOME=/codex HOME=/home/agent`; `WORKDIR /workspace`; `CMD ["sleep", "infinity"]`.
 - **Why:** the image in `docs/codex-sdk.md`, "Inside Docker", plus the tools an assistant commonly needs; CA certificates are required or turns hang.
 
 #### `requirements.txt` (new)
 
 - **What changes:** pinned: `fastapi==0.162.0`, `uvicorn==0.54.0`, `openai-codex==0.163.0`, `httpx==0.28.1`, `croniter==6.2.4`, `python-multipart==0.0.33`, `pytest==9.2.0`, `pytest-asyncio==1.4.1.post1`.
-- **Why:** reproducible installs; versions are the ones the spike and tests ran with.
+- **Why:** reproducible installs; versions are the ones the tests ran with.
 
 #### `pytest.ini` (new)
 

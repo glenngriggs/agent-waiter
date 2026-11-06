@@ -247,6 +247,13 @@ def test_slow_message_can_be_stopped(user, agent) -> None:
 
     assert done["data"]["status"] == "interrupted"
     assert done["data"]["error_kind"] == "interrupted"
+    # The text that streamed before Stop is persisted, so a reload shows it.
+    saved = [
+        e for e in history(user, agent["id"])["events"]
+        if e["turn_id"] == turn_id and e["kind"] == "item_completed"
+        and e["data"]["item_type"] == "agent_message"
+    ]
+    assert saved and saved[-1]["data"]["partial"] is True and saved[-1]["data"]["text"].startswith("tick0")
     wait_for(lambda: get_agent(user, agent["id"])["chat_busy"] is False, timeout=5, message="chat free")
     # The composer is free again: the next message runs normally.
     assert chat(user, agent["id"], "after the stop")["data"]["status"] == "completed"

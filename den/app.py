@@ -67,6 +67,16 @@ class CSRFMiddleware:
         await self.app(scope, receive, send)
 
 
+class _RevalidatingStatic(StaticFiles):
+    """StaticFiles with `Cache-Control: no-cache`, so browsers revalidate (via
+    ETag) on every load instead of running a stale app.js after an update."""
+
+    def file_response(self, *args, **kwargs):  # type: ignore[override]
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 def _validation_message(exc: RequestValidationError) -> str:
     """Turn pydantic's error list into one sentence for `{"detail": "..."}`."""
     errors = exc.errors()
@@ -171,7 +181,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # no-store so a new deploy's page (and its script tags) load at once.
         return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-store"})
 
-    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    app.mount("/static", _RevalidatingStatic(directory=STATIC_DIR), name="static")
     return app
 
 

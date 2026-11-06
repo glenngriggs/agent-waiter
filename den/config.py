@@ -119,9 +119,9 @@ def load_settings(env: Mapping[str, str] = os.environ) -> Settings:
         # for AGENTS.md, and must not find this project's course instructions.
         data_dir=Path(env.get("DEN_DATA_DIR", "~/.local/share/den")).expanduser().resolve(),
         runtime=runtime,
-        host=env.get("DEN_HOST", default_host),
+        host=env.get("DEN_HOST", "").strip() or default_host,
         port=port,
-        agent_backend_url=env.get("DEN_AGENT_BACKEND_URL", default_agent_url).rstrip("/"),
+        agent_backend_url=(env.get("DEN_AGENT_BACKEND_URL", "").strip() or default_agent_url).rstrip("/"),
         model_auth=model_auth,
         upstream_base_url=base_url.rstrip("/"),
         upstream_api_key=api_key,
