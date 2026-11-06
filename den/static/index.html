@@ -4,7 +4,20 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AgentWaiter</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M12 8a8 8 0 0 0-8 8h16a8 8 0 0 0-8-8z' fill='%231b1f24'/%3E%3Cpath d='M2.5 19h19M12 8V5.5M10 5.5h4' fill='none' stroke='%231b1f24' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cstyle%3E.f%7Bfill:%231b1f24%7D.s%7Bstroke:%231b1f24%7D@media (prefers-color-scheme:dark)%7B.f%7Bfill:%23e4e7eb%7D.s%7Bstroke:%23e4e7eb%7D%7D%3C/style%3E%3Cpath class='f' d='M12 8a8 8 0 0 0-8 8h16a8 8 0 0 0-8-8z'/%3E%3Cpath class='s' d='M2.5 19h19M12 8V5.5M10 5.5h4' fill='none' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E">
+  <script>
+    // Set the theme before the first paint so a dark page never flashes white.
+    // The header toggle's stored choice wins; otherwise follow the system.
+    // app.js (initTheme) keeps it in sync after load.
+    (function () {
+      var theme = null;
+      try { theme = localStorage.getItem("agentwaiter-theme"); } catch (e) {}
+      if (theme !== "light" && theme !== "dark") {
+        theme = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+      }
+      document.documentElement.setAttribute("data-theme", theme);
+    })();
+  </script>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -22,9 +35,13 @@
       </svg>
       <span class="brand-name">AgentWaiter</span>
     </a>
-    <div id="user-box" class="user-box" hidden>
-      <span id="user-email" class="user-email"></span>
-      <button id="logout-btn" class="btn btn-ghost btn-sm" type="button">Log out</button>
+    <div class="topbar-right">
+      <!-- Light/dark switch; its icon and label are set by initTheme() in app.js. -->
+      <button id="theme-toggle" class="btn btn-ghost btn-sm btn-icon theme-toggle" type="button" aria-label="Switch theme"></button>
+      <div id="user-box" class="user-box" hidden>
+        <span id="user-email" class="user-email"></span>
+        <button id="logout-btn" class="btn btn-ghost btn-sm" type="button">Log out</button>
+      </div>
     </div>
   </header>
 

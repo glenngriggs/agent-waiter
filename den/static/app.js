@@ -73,6 +73,8 @@
   // Static path data only (24x24, stroked). Never built from server data.
   const ICONS = {
     plus: "M12 5v14M5 12h14",
+    sun: "M12 16a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4",
+    moon: "M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z",
     x: "M6 6l12 12M18 6L6 18",
     check: "M5 12l5 5 9-10",
     back: "M15 18l-6-6 6-6",
@@ -3164,7 +3166,58 @@
   // 12. Boot
   // ======================================================================
 
+  // ---- Light and dark theme ----------------------------------------------
+  // index.html applies the theme before the first paint; this wires up the
+  // header toggle. A choice made with the toggle is stored and wins. Until the
+  // user makes one, the page follows the system setting, even if it changes
+  // while the page is open.
+
+  const THEME_KEY = "agentwaiter-theme";
+  const systemDark = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
+
+  /** The theme picked with the toggle, or null if the user never picked one. */
+  function storedTheme() {
+    try {
+      const theme = localStorage.getItem(THEME_KEY);
+      return theme === "light" || theme === "dark" ? theme : null;
+    } catch (err) {
+      return null; // storage blocked: follow the system
+    }
+  }
+
+  function applyTheme(theme) {
+    document.documentElement.setAttribute("data-theme", theme);
+    const btn = document.getElementById("theme-toggle");
+    const label = theme === "dark" ? "Switch to light mode" : "Switch to dark mode";
+    btn.setAttribute("aria-label", label);
+    btn.title = label;
+    btn.replaceChildren(icon(theme === "dark" ? "sun" : "moon"));
+  }
+
+  function initTheme() {
+    // Also kept in memory, so a choice still holds against system changes
+    // when storage is blocked and setItem below fails.
+    let chosen = storedTheme();
+    applyTheme(chosen || (systemDark && systemDark.matches ? "dark" : "light"));
+    document.getElementById("theme-toggle").addEventListener("click", () => {
+      const next = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
+      chosen = next;
+      try {
+        localStorage.setItem(THEME_KEY, next);
+      } catch (err) {
+        // Storage blocked: the choice holds (in memory) until the page reloads.
+      }
+      applyTheme(next);
+    });
+    if (systemDark) {
+      const follow = (e) => { if (!chosen) applyTheme(e.matches ? "dark" : "light"); };
+      if (systemDark.addEventListener) systemDark.addEventListener("change", follow);
+      else if (systemDark.addListener) systemDark.addListener(follow); // older Safari
+    }
+  }
+
   async function boot() {
+    initTheme();
     document.getElementById("logout-btn").addEventListener("click", logout);
     window.addEventListener("hashchange", route);
     const root = document.getElementById("app");

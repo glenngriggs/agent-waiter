@@ -1,7 +1,7 @@
 /*
- * AgentWaiter web client styles. Light theme, system font, no external assets.
+ * AgentWaiter web client styles. Light and dark themes, system font, no external assets.
  * Sections: tokens, base, header, controls, feedback, layout, agents, onboarding,
- * agent page, chat timeline, composer, files, jobs, dialog, responsive.
+ * agent page, chat timeline, composer, files, jobs, dialog, responsive, dark theme.
  */
 
 /* ---------- tokens ---------- */
@@ -93,6 +93,10 @@ code, pre, .mono { font-family: var(--mono); font-size: 0.86em; }
 .brand { display: inline-flex; align-items: center; gap: 8px; color: var(--text); font-weight: 700; font-size: 1.1rem; letter-spacing: -0.01em; }
 .brand:hover { text-decoration: none; }
 .brand-mark { width: 22px; height: 22px; flex: none; color: var(--text); }
+.topbar-right { display: flex; align-items: center; gap: 6px; min-width: 0; }
+/* kept shorter than the brand line so it never changes the header's height */
+.btn.theme-toggle { min-height: 0; padding: 3px 6px; }
+.theme-toggle .icon { width: 17px; height: 17px; }
 .user-box { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .user-email { color: var(--text-2); font-size: 0.875rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
@@ -636,3 +640,78 @@ textarea { resize: vertical; }
 .bubble.rich > .code-block:last-child { margin-bottom: 0; }
 .bubble.rich a.md-link { color: var(--accent, #3b5bdb); text-decoration: underline; text-underline-offset: 2px; overflow-wrap: anywhere; }
 .msg-user .bubble.rich a.md-link { color: #fff; }
+
+/* ---------- dark theme ----------
+ * index.html sets data-theme on <html> before the first paint (the stored
+ * choice from the header toggle, else the system setting); app.js keeps it in
+ * sync. Dark mode only swaps the tokens above and the few colours that are
+ * written out literally; layout never changes.
+ * Every override below is wrapped in :where(...) so it has the same
+ * specificity as the light rule it replaces and wins only by coming later.
+ * Without that, a dark "a" rule would beat ".btn-primary" on link buttons. */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #111317;
+  --surface: #1a1d22;
+  --surface-2: #23272e;
+  --border: #2f343c;
+  --border-strong: #424852;
+  --text: #e4e7eb;
+  --text-2: #a7aeb8;
+  --text-3: #7f8792;
+  --accent: #4c6ef5;
+  --accent-hover: #3b5bdb;
+  --accent-soft: #1d2645;
+  --ok: #3fb950;
+  --ok-soft: #13291a;
+  --info: #6ea8fe;
+  --info-soft: #15243b;
+  --warn: #e3b341;
+  --warn-soft: #2b2310;
+  --warn-border: #5c4813;
+  --danger: #f26b6f;
+  --danger-soft: #2c1517;
+  --danger-border: #5f2427;
+  --agent: #a7aeb8;
+  --agent-soft: #262a31;
+  --code-bg: #0d0f12;
+  --code-text: #d6dce4;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.35), 0 1px 3px rgba(0, 0, 0, 0.25);
+  --shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.55);
+}
+/* the accent is too dark to read as text on a dark surface; buttons keep it as a fill */
+:where(:root[data-theme="dark"]) a { color: #8da2fb; }
+:where(:root[data-theme="dark"]) .tab.active { color: #8da2fb; }
+:where(:root[data-theme="dark"]) .bubble.rich a.md-link { color: #8da2fb; }
+:where(:root[data-theme="dark"]) .btn-danger { background: #c93035; border-color: #c93035; }
+:where(:root[data-theme="dark"]) .btn-danger:hover { background: #ad2529; border-color: #ad2529; }
+:where(:root[data-theme="dark"]) input:focus,
+:where(:root[data-theme="dark"]) select:focus,
+:where(:root[data-theme="dark"]) textarea:focus { box-shadow: 0 0 0 3px rgba(76, 110, 245, 0.35); }
+:where(:root[data-theme="dark"]) .notice-info { border-color: #284676; }
+:where(:root[data-theme="dark"]) .toast { background: #353b45; }
+:where(:root[data-theme="dark"]) .toast-error { background: #a61e1e; }
+:where(:root[data-theme="dark"]) .toast-ok { background: #1b6e3f; }
+:where(:root[data-theme="dark"]) .toast-info { background: #353b45; }
+:where(:root[data-theme="dark"]) .avatar-tint {
+  background: hsl(var(--hue) 30% 20%); border-color: hsl(var(--hue) 28% 31%); color: hsl(var(--hue) 70% 78%);
+}
+:where(:root[data-theme="dark"]) .error-card { color: #f3b4b4; }
+:where(:root[data-theme="dark"]) .bubble.rich blockquote { color: var(--text-2); }
+:where(:root[data-theme="dark"]) .inline-code { background: rgba(255, 255, 255, 0.1); }
+:where(:root[data-theme="dark"]) .drop-hint { background: rgba(29, 38, 69, 0.92); color: #8da2fb; }
+:where(:root[data-theme="dark"]) .preview-image { background: repeating-conic-gradient(#2a2f37 0 25%, #1f2329 0 50%) 0 0 / 16px 16px; }
+:where(:root[data-theme="dark"]) .job-card.job-cancelled,
+:where(:root[data-theme="dark"]) .job-card.job-finished { background: #16181c; }
+:where(:root[data-theme="dark"]) .dialog::backdrop { background: rgba(0, 0, 0, 0.6); }
+/* code blocks: a dark card with the VS Code "Dark+" palette */
+:where(:root[data-theme="dark"]) .rich .code-block { background: #16181c; color: #d4d4d4; }
+:where(:root[data-theme="dark"]) .tok-kw,
+:where(:root[data-theme="dark"]) .tok-lit { color: #569cd6; }
+:where(:root[data-theme="dark"]) .tok-ctl { color: #c586c0; }
+:where(:root[data-theme="dark"]) .tok-type { color: #4ec9b0; }
+:where(:root[data-theme="dark"]) .tok-fn { color: #dcdcaa; }
+:where(:root[data-theme="dark"]) .tok-var { color: #9cdcfe; }
+:where(:root[data-theme="dark"]) .tok-str { color: #ce9178; }
+:where(:root[data-theme="dark"]) .tok-num { color: #b5cea8; }
+:where(:root[data-theme="dark"]) .tok-com { color: #6a9955; }
