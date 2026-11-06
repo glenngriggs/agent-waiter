@@ -36,7 +36,8 @@ _DAEMON_DOWN_MARKERS = (
     "cannot connect to the docker daemon",
     "error during connect",
     "is the docker daemon running",
-    "permission denied while trying to connect to the docker daemon",
+    # Docker 29 says "...to the docker API at unix://..."; older ones say "daemon".
+    "permission denied while trying to connect to the docker",
     "could not be found in this wsl",
 )
 
@@ -155,8 +156,17 @@ class DockerRuntime(AgentRuntime):
         if rc != 0:
             lowered = err.lower()
             if any(marker in lowered for marker in _DAEMON_DOWN_MARKERS):
+                hint = ""
+                if "permission denied" in lowered:
+                    # The usual cause: the user was added to the docker group
+                    # after this shell started, so the server lacks the group.
+                    hint = (
+                        " The server's user cannot use Docker: add it to the docker group, "
+                        "then restart the server from a new terminal (or run it with "
+                        "`sg docker -c ...`)."
+                    )
                 raise AgentRuntimeError(
-                    f"Docker is not available on the server: {_first_line(err)}", err[-2000:]
+                    f"Docker is not available on the server: {_first_line(err)}{hint}", err[-2000:]
                 )
             if check:
                 raise AgentRuntimeError(
@@ -212,6 +222,8 @@ class DockerRuntime(AgentRuntime):
                         timeout=_BUILD_TIMEOUT_SECONDS,
                     )
                 except AgentRuntimeError as exc:
+                    if exc.message.startswith("Docker is not available"):
+                        raise  # not a build problem; keep the real cause
                     # BuildKit's first stderr line is progress chatter
                     # ("#0 building with ..."); the real cause is an ERROR line.
                     lines = [ln.strip() for ln in exc.detail.splitlines() if ln.strip()]
