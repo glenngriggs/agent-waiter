@@ -713,12 +713,13 @@ async def respond(
     client = get_client(api_key, base_url)
     plain = _plain_mode(api_key, model)
     attempt_params, betas = (params, []) if plain else add_extras(params, tool_map)
+    has_extras = attempt_params != params
     try:
         try:
             manager, stream = await _open_stream(client, attempt_params, betas)
         except anthropic.BadRequestError as exc:
-            if plain or (attempt_params is params and not betas):
-                raise
+            if not has_extras:
+                raise  # nothing optional to take away: the 400 stands
             logger.info("Claude request with extras refused for agent %s (%s); retrying plain",
                         agent_id, _api_message(exc)[:200])
             _set_plain_mode(api_key, model)
