@@ -2,22 +2,17 @@
 
 Self-hosted web platform for personal AI agents, written in Python. Anyone can sign up in the browser, create agents, chat with them, browse the files they produce, and give them scheduled jobs. Each agent runs in its own Docker container with [Codex app server](https://github.com/openai/codex) as the harness inside it, and every user brings their own model API key.
 
-<table>
-  <tr>
-    <td colspan="2" align="center"><a href="docs/screenshots/chat.png"><img src="docs/screenshots/chat.png" alt="Chatting with an agent while it works" width="48%"></a></td>
-  </tr>
-  <tr>
-    <td colspan="2" align="center"><b>Chat</b>: replies stream live, and you can queue a message, interrupt, or stop while the agent works</td>
-  </tr>
-  <tr>
-    <td width="50%" align="center"><a href="docs/screenshots/agents-page.png"><img src="docs/screenshots/agents-page.png" alt="The agents page, one card per agent"></a></td>
-    <td width="50%" align="center"><a href="docs/screenshots/files.png"><img src="docs/screenshots/files.png" alt="The file browser with a file preview"></a></td>
-  </tr>
-  <tr>
-    <td align="center"><b>Agents</b>: each has its own container, files, conversation, and schedule</td>
-    <td align="center"><b>Files</b>: browse, preview, upload, and download the agent's workspace</td>
-  </tr>
-</table>
+<p align="center">
+  <img src="docs/screenshots/overview.png" alt="Agent Waiter: chatting with an agent, its files, and the agents page" width="100%">
+</p>
+
+<p align="center">
+  <sub>
+    <a href="docs/screenshots/chat.png">Chat</a> ·
+    <a href="docs/screenshots/files.png">Files</a> ·
+    <a href="docs/screenshots/agents-page.png">Agents</a>
+  </sub>
+</p>
 
 ## Overview
 
