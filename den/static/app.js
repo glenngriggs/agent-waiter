@@ -20,6 +20,8 @@
   "use strict";
 
   const HISTORY_LIMIT = 300;
+  // While an agent looks busy, how often the page re-checks that with the server.
+  const BUSY_CHECK_MS = 8000;
   const COMMAND_OUTPUT_KEEP = 20000; // characters of live command output kept per command row
 
   // ======================================================================
@@ -1053,6 +1055,10 @@
       // started or were cancelled, so a late POST answer or replayed event cannot re-add them.
       this.queue = [];
       this.leftQueue = new Set();
+      // Chat turns whose turn_completed we have seen. A turn can end before the answer to
+      // the POST that started it is handled; that answer must not mark the agent busy again.
+      this.endedTurns = new Set();
+      this.busyTimer = null;      // while busy: re-checks the server's busy state (see watchBusy)
       this.draft = "";
       this.expandedJobs = new Set();
       this.timeline = new Timeline({
@@ -1175,11 +1181,42 @@
       }
       if (this.closed) return;
       this.setAgent(res.agent);
-      // Ignore the answer if a turn started or ended (from our own events) after we asked.
-      if (this.busyChangedAt <= askedAt && this.busy && !res.agent.chat_busy) {
+      this.syncBusy(res.agent, askedAt);
+    }
+
+    /**
+     * Make busy state match the agent row the server just sent. The event stream is the
+     * normal source, but an event can be missed (a stalled connection, a race with a POST
+     * answer), and a stale "busy" leaves the composer saying Queue with nothing running.
+     * The answer is ignored if a turn started or ended (from our own events) after we asked.
+     */
+    syncBusy(agent, askedAt) {
+      if (!agent || this.closed || this.busyChangedAt > askedAt) return;
+      if (this.busy && !agent.chat_busy) {
         this.setBusy(false, null);
         this.timeline.finishDangling();
+      } else if (!this.busy && agent.chat_busy) {
+        this.setBusy(true, agent.active_turn_id || null);
       }
+    }
+
+    /** While the page shows the agent as busy, ask the server every few seconds if it still is. */
+    watchBusy() {
+      if (this.busy && !this.closed) {
+        if (this.busyTimer === null) {
+          this.busyTimer = setInterval(() => {
+            this.reconcile().catch((err) => console.warn("Busy check failed", err));
+          }, BUSY_CHECK_MS);
+        }
+      } else if (this.busyTimer !== null) {
+        clearInterval(this.busyTimer);
+        this.busyTimer = null;
+      }
+    }
+
+    /** True once this chat turn's turn_completed has been seen. */
+    hasEnded(turnId) {
+      return this.endedTurns.has(turnId);
     }
 
     handleGone() {
@@ -1240,6 +1277,7 @@
           break;
         case "turn_completed":
           this.partials.delete(ev.turn_id);
+          if (ev.channel === "chat" && ev.turn_id) this.endedTurns.add(ev.turn_id);
           if (ev.channel === "chat" && (!this.activeTurnId || this.activeTurnId === ev.turn_id)) this.setBusy(false, null);
           this.scheduleRefresh();
           break;
@@ -1295,6 +1333,7 @@
       if (!busy) this.stopping = false;
       this.busyChangedAt = Date.now();
       this.timeline.setWorking(busy, this.stopping ? "Stopping…" : "Working…");
+      this.watchBusy();
       this.notify();
     }
 
@@ -1354,6 +1393,8 @@
       this.source = null;
       clearTimeout(this.reconnectTimer);
       clearTimeout(this.refreshTimer);
+      if (this.busyTimer !== null) clearInterval(this.busyTimer);
+      this.busyTimer = null;
       this.listeners.clear();
       this.changeListeners.clear();
     }
@@ -2626,8 +2667,10 @@
       stopBtn.disabled = session.stopping;
       stopLabel.textContent = session.stopping ? "Stopping…" : "Stop";
       input.disabled = sending;
-      sendBtn.disabled = sending;
-      interruptBtn.disabled = sending || session.stopping;
+      // With nothing typed the buttons are visibly off, never a click that does nothing.
+      const empty = !input.value.trim();
+      sendBtn.disabled = sending || empty;
+      interruptBtn.disabled = sending || empty || session.stopping;
       newConvBtn.disabled = busy;
       input.placeholder = busy ? `Message ${session.agent.name}… (it runs when the current task finishes)` : `Message ${session.agent.name}…`;
       hint.textContent = busy
@@ -2645,6 +2688,7 @@
       const text = input.value;
       if (!text.trim() || sending) return;
       const interrupt = mode === "interrupt" && session.busy;
+      const interrupted = session.activeTurnId; // the turn an interrupt is meant to stop
       sending = true;
       update();
       try {
@@ -2656,10 +2700,14 @@
           // It shows in the timeline only once it starts (turn_started); until then it waits
           // in the queue panel. The turn_queued event may already have added it.
           session.enqueue({ turn_id: res.turn_id, prompt: text, priority: interrupt ? 1 : 0, queued_at: new Date().toISOString() });
-          if (interrupt && session.busy) session.setStopping(true);
+          // "Stopping…" only while the interrupted turn is still the one running: its end
+          // (and the start of this message) may already have arrived on the event stream.
+          if (interrupt && session.busy && session.activeTurnId === interrupted) session.setStopping(true);
           else session.notify();
         } else {
-          session.setBusy(true, res.turn_id);
+          // A turn that fails at once can end before this answer is handled. Marking the
+          // agent busy then would never be undone, and Send would stay "Queue" for nothing.
+          if (!session.hasEnded(res.turn_id)) session.setBusy(true, res.turn_id);
           session.timeline.addUserMessage(res.turn_id, text);
         }
       } catch (err) {
@@ -2725,6 +2773,7 @@
     input.addEventListener("input", () => {
       session.draft = input.value;
       autosize();
+      update(); // Send/Queue switch on and off with the text
     });
 
     // The chat panel fills the window below the header so the timeline scrolls, not the page.

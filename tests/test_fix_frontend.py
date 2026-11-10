@@ -171,3 +171,80 @@ def test_usage_since_is_the_same_calendar_day_in_every_timezone(tz):
     out = _run_node(script, tz=tz)
     assert out["day"] == "Oct 8, 2026"
     assert out["bad"] == "—"
+
+
+# --- Stale "busy" state: the composer said Queue with nothing running -------------------
+
+_SESSION_STUB = "\n".join([
+    "const BUSY_CHECK_MS = 8000;",
+    "let now = 1000; Date.now = () => now;",
+    "const timers = []; globalThis.setInterval = (fn) => { timers.push(fn); return timers.length; };",
+    "globalThis.clearInterval = () => {};",
+    "class AgentSession {",
+    "  constructor() {",
+    "    this.busy = false; this.activeTurnId = null; this.stopping = false; this.closed = false;",
+    "    this.busyChangedAt = 0; this.busyTimer = null; this.endedTurns = new Set();",
+    "    this.partials = new Map(); this.dangling = 0;",
+    "    this.timeline = { setWorking() {}, finishDangling: () => { this.dangling++; } };",
+    "  }",
+    "  notify() {} scheduleRefresh() {} dequeue() {} enqueue() {}",
+])
+
+
+def _session_script(body: str) -> str:
+    src = _source()
+    methods = [_method(src, "AgentSession", name)
+               for name in ("track", "setBusy", "syncBusy", "watchBusy", "hasEnded")]
+    return "\n".join([_SESSION_STUB, *methods, "}", "const s = new AgentSession();", body])
+
+
+def test_a_turn_that_already_ended_is_remembered():
+    # A turn that fails at once can end before the POST answer that started it is handled.
+    # The composer asks hasEnded() before marking the agent busy on that answer; without
+    # it the page stayed "busy" for good and Send read "Queue" with nothing running.
+    out = _run_node(_session_script(
+        "s.track({ kind: 'turn_started', channel: 'chat', turn_id: 't1', data: {} });"
+        "const busyDuring = s.busy;"
+        "s.track({ kind: 'turn_completed', channel: 'chat', turn_id: 't1', data: {} });"
+        "console.log(JSON.stringify({ busyDuring, busyAfter: s.busy, ended: s.hasEnded('t1'),"
+        " other: s.hasEnded('t2') }));"
+    ))
+    assert out == {"busyDuring": True, "busyAfter": False, "ended": True, "other": False}
+
+
+def test_composer_does_not_mark_an_ended_turn_busy():
+    src = _source()
+    send = _extract_block(src, src.index("    async function send(mode) {"))
+    assert "if (!session.hasEnded(res.turn_id)) session.setBusy(true, res.turn_id);" in send
+    # "Stopping…" is only shown while the interrupted turn is still the running one.
+    assert "session.activeTurnId === interrupted" in send
+
+
+def test_stale_busy_heals_from_the_agent_row():
+    # The page missed a turn_completed (stalled stream). The periodic check sees the server
+    # is idle and clears busy; the reverse (server busy, page idle) is corrected too.
+    out = _run_node(_session_script(
+        "s.setBusy(true, 't1'); const watching = timers.length;"
+        "now = 5000; s.syncBusy({ chat_busy: false }, 4000);"
+        "const healed = { busy: s.busy, dangling: s.dangling };"
+        "now = 6000; s.syncBusy({ chat_busy: true, active_turn_id: 't2' }, 5500);"
+        "console.log(JSON.stringify({ watching, healed, busy: s.busy, active: s.activeTurnId }));"
+    ))
+    assert out == {"watching": 1, "healed": {"busy": False, "dangling": 1}, "busy": True, "active": "t2"}
+
+
+def test_busy_check_ignores_an_answer_older_than_the_last_change():
+    # Asked at t=4000, but a turn started at t=5000 (from our own events) before the answer
+    # came back saying "idle": the answer describes the past and must not clear busy.
+    out = _run_node(_session_script(
+        "now = 5000; s.setBusy(true, 't1'); s.syncBusy({ chat_busy: false }, 4000);"
+        "console.log(JSON.stringify({ busy: s.busy }));"
+    ))
+    assert out == {"busy": True}
+
+
+def test_send_is_disabled_while_the_message_is_empty():
+    # Clicking Send/Queue with nothing typed used to do nothing at all, silently.
+    src = _source()
+    assert "sendBtn.disabled = sending || empty;" in src
+    assert "interruptBtn.disabled = sending || empty || session.stopping;" in src
