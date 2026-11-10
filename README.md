@@ -2,6 +2,21 @@
 
 Self-hosted web platform for personal AI agents, written in Python. Anyone can sign up in the browser, create agents, chat with them, browse the files they produce, and give them scheduled jobs. Each agent runs in its own Docker container with [Codex app server](https://github.com/openai/codex) as the harness inside it, and every user brings their own model API key.
 
+<p align="center">
+  <img src="docs/screenshots/chat.png" alt="Chatting with an agent while it works, with Stop, Interrupt &amp; send, and Queue" width="820">
+</p>
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/agents.png" alt="The agents page, one card per agent"></td>
+    <td width="50%"><img src="docs/screenshots/files.png" alt="The file browser showing files an agent wrote, with a preview"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>Each agent has its own container, files, conversation, and schedule</sub></td>
+    <td align="center"><sub>Browse, preview, and download the files an agent writes</sub></td>
+  </tr>
+</table>
+
 ## Overview
 
 The platform includes:
