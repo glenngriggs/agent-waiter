@@ -4,7 +4,7 @@ Self-hosted web platform for personal AI agents, written in Python. Anyone can s
 
 <table>
   <tr>
-    <td colspan="2" align="center"><a href="docs/screenshots/chat.png"><img src="docs/screenshots/chat.png" alt="Chatting with an agent while it works" width="600"></a></td>
+    <td colspan="2" align="center"><a href="docs/screenshots/chat.png"><img src="docs/screenshots/chat.png" alt="Chatting with an agent while it works" width="48%"></a></td>
   </tr>
   <tr>
     <td colspan="2" align="center"><b>Chat</b>: replies stream live, and you can queue a message, interrupt, or stop while the agent works</td>
