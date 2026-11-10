@@ -141,7 +141,7 @@ def test_real_container_end_to_end(fake_model, tmp_path, client_factory) -> None
 def test_stop_kills_a_command_running_inside_the_container(fake_model, tmp_path, client_factory) -> None:
     """Stop must end the agent's running command, not just the docker exec client.
 
-    docs/codex-sdk.md saw a command survive an aborted `docker exec` (with the
+    A command has been seen to survive an aborted `docker exec` (with the
     TypeScript SDK), so this checks the Python path end to end.
     """
     import time

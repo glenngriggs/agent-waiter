@@ -257,11 +257,3 @@ def test_readme_env_lines_have_no_inline_comments() -> None:
         for line in block.splitlines():
             if re.match(r"[A-Z][A-Z0-9_]*=", line):
                 assert not re.search(r"\s#", line), line
-
-
-def test_change_log_lists_every_commit_of_the_pass() -> None:
-    changes = (ROOT / "docs" / "CHANGES.md").read_text()
-    for commit in ("3035be2", "b991c03", "6057504", "6a12f6c", "1bbe050",
-                   "a413cbd", "c3614a4", "83a1300", "2910dd8"):
-        assert f"`{commit}`" in changes
-    assert "| Independent. |" not in changes

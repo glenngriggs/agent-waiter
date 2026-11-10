@@ -196,7 +196,7 @@ def load_settings(env: Mapping[str, str] = os.environ) -> Settings:
 
     return Settings(
         # Outside the repo by default: Codex walks up from a workspace looking
-        # for AGENTS.md, and must not find this project's course instructions.
+        # for AGENTS.md, and must not pick up instructions from this repository.
         data_dir=Path(env.get("DEN_DATA_DIR", "~/.local/share/den")).expanduser().resolve(),
         runtime=runtime,
         host=env.get("DEN_HOST", "").strip() or default_host,

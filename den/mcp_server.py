@@ -4,7 +4,7 @@ Neither Codex SDK can register tools, so each agent's config.toml points
 Codex at this endpoint (streamable HTTP, JSON responses only). It is a
 deliberately small JSON-RPC 2.0 server: `initialize`, `ping`, `tools/list`
 and `tools/call`; notifications get 202 and GET/DELETE get 405, which is
-what docs/codex-sdk.md verified Codex accepts.
+what Codex accepts.
 
 The bearer token identifies the agent, so every tool is scoped to that
 agent's own jobs. Agents may cancel only jobs they created themselves.
