@@ -4,27 +4,18 @@ Self-hosted web platform for personal AI agents, written in Python. Anyone can s
 
 <table>
   <tr>
-    <td width="33%" valign="top">
-      <a href="docs/screenshots/agents.png"><img src="docs/screenshots/agents.png" alt="The agents page, one card per agent"></a>
-      <br>
-      <b>Agents</b>
-      <br>
-      <sub>Each agent has its own container, files, conversation, and schedule.</sub>
-    </td>
-    <td width="33%" valign="top">
-      <a href="docs/screenshots/chat.png"><img src="docs/screenshots/chat.png" alt="Chatting with an agent while it works"></a>
-      <br>
-      <b>Chat</b>
-      <br>
-      <sub>Replies stream live. Queue a message, interrupt, or stop while the agent works.</sub>
-    </td>
-    <td width="33%" valign="top">
-      <a href="docs/screenshots/files.png"><img src="docs/screenshots/files.png" alt="The file browser with a file preview"></a>
-      <br>
-      <b>Files</b>
-      <br>
-      <sub>Browse, preview, upload, and download everything in the agent's workspace.</sub>
-    </td>
+    <td colspan="2" align="center"><a href="docs/screenshots/chat.png"><img src="docs/screenshots/chat.png" alt="Chatting with an agent while it works" width="600"></a></td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center"><b>Chat</b>: replies stream live, and you can queue a message, interrupt, or stop while the agent works</td>
+  </tr>
+  <tr>
+    <td width="50%" align="center"><a href="docs/screenshots/agents-page.png"><img src="docs/screenshots/agents-page.png" alt="The agents page, one card per agent"></a></td>
+    <td width="50%" align="center"><a href="docs/screenshots/files.png"><img src="docs/screenshots/files.png" alt="The file browser with a file preview"></a></td>
+  </tr>
+  <tr>
+    <td align="center"><b>Agents</b>: each has its own container, files, conversation, and schedule</td>
+    <td align="center"><b>Files</b>: browse, preview, upload, and download the agent's workspace</td>
   </tr>
 </table>
 
